@@ -26,8 +26,11 @@
 //! a dense-transformer kernel stack and return garbage with no error at all.
 //!
 //! [`check_dense_layer_inventory`] converts the luck into a contract. It runs
-//! before any pointer is taken and refuses, by name and by count, any model
-//! whose layer inventory is not the dense shape. See its docs for the rule.
+//! before any pointer is taken and refuses, by name and by per-layer kind, any
+//! model whose layer inventory is not the dense shape. On acceptance it returns
+//! the [`DenseLayout`] it walked, and `extract_model_weights` indexes that —
+//! the validated layout and the performed reads are one object. See its docs
+//! for the rule.
 
 #[cfg(feature = "cuda")]
 use candle_core::{Storage, Tensor};
@@ -39,6 +42,29 @@ use candle_core::{Storage, Tensor};
 /// `layers[1 + i * DENSE_PROJS_PER_LAYER + k]` positionally and
 /// `LayerWeights` has exactly these seven slots.
 pub const DENSE_PROJS_PER_LAYER: usize = 7;
+
+/// The per-layer *kind* the inventory reports, and the only kind the dense
+/// decode path can consume.
+///
+/// The old check asked one question with one global constant — "did every
+/// layer contribute exactly seven?" — which is a count, not a kind. Counting is
+/// enough to *refuse*, but it cannot say what a heterogeneous model is made of,
+/// and DeepSeek-V4 is heterogeneous by construction: `deepseek4.rs:4931-4942`
+/// emits three projections for a `MoeOrMlp::Mlp` layer and
+/// `moe.get_isq_layers()` — shared experts plus every routed expert's
+/// gate/up/down — for a `MoeOrMlp::Moe` layer, in the same model.
+///
+/// [`LayerCensus`] therefore classifies every layer independently and reports
+/// the distribution, so a refusal can say "0 of 62 layers are dense" instead of
+/// naming layer 0 and stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerCensus {
+    /// Layers that contributed exactly [`DENSE_PROJS_PER_LAYER`] entries.
+    pub dense: usize,
+    /// Layers that contributed anything else — MoE experts, MLA projections,
+    /// a fused QKV, a two-matrix MLP. All undescribable by [`DecodeConfig`].
+    pub non_dense: usize,
+}
 
 /// Why a model's layer inventory is not the dense shape the decode path needs.
 ///
@@ -65,10 +91,30 @@ pub enum DenseShapeError {
     /// A layer did not contribute exactly [`DENSE_PROJS_PER_LAYER`] entries.
     /// This is the variant a MoE model trips: 256 experts x 3 projections plus
     /// the attention projections is not 7.
+    ///
+    /// `census` carries the whole model's distribution, not just this layer's,
+    /// so the message can distinguish "one odd layer" from "this is a MoE".
     LayerProjCountMismatch {
         layer: usize,
         found: usize,
         expected: usize,
+        census: LayerCensus,
+        num_layers: usize,
+    },
+    /// Position `position` should hold a projection of layer `expected` and
+    /// holds a projection of layer `found` instead (`None` = the inventory ends
+    /// before that position).
+    ///
+    /// Counts alone cannot catch this. An inventory of `[lm_head, 1×7, 0×7]`
+    /// gives both layers a count of seven, so the histogram rule accepts it —
+    /// and then `extract_model_weights` reads positions `1..=7` as layer 0 and
+    /// builds a pointer set in which every layer's weights belong to a
+    /// different layer. No bound is violated, nothing faults, and decode
+    /// returns fluent garbage. Only walking the blocks *in order* sees it.
+    LayerOutOfOrder {
+        position: usize,
+        expected: usize,
+        found: Option<usize>,
     },
 }
 
@@ -98,16 +144,82 @@ impl std::fmt::Display for DenseShapeError {
                 layer,
                 found,
                 expected,
+                census,
+                num_layers,
             } => write!(
                 f,
                 "layer {layer} contributed {found} quantized projections, expected exactly {expected} \
-                 (q, k, v, o, gate, up, down) — a MoE or MLA layer is not describable by DecodeConfig"
+                 (q, k, v, o, gate, up, down) — a MoE or MLA layer is not describable by DecodeConfig. \
+                 Across the whole model {}/{num_layers} layers are dense and {}/{num_layers} are not, \
+                 so this is the architecture, not one odd layer",
+                census.dense, census.non_dense
             ),
+            Self::LayerOutOfOrder {
+                position,
+                expected,
+                found,
+            } => match found {
+                Some(found) => write!(
+                    f,
+                    "position {position} holds a projection of layer {found} where the extractor \
+                     reads layer {expected} — the per-layer blocks are out of order or interleaved. \
+                     Every layer contributed the right *count*, so a histogram accepts this and the \
+                     extractor then assigns every layer another layer's weights, silently"
+                ),
+                None => write!(
+                    f,
+                    "the inventory ends before position {position}, which the extractor reads as a \
+                     projection of layer {expected}"
+                ),
+            },
         }
     }
 }
 
 impl std::error::Error for DenseShapeError {}
+
+/// Where each layer's projections actually sit in the inventory.
+///
+/// This is the check's *output*, not a by-product: `extract_model_weights` used
+/// to recompute `1 + i * DENSE_PROJS_PER_LAYER + k` for itself, which meant the
+/// guard validated one indexing scheme and the extractor performed another one
+/// that merely happened to agree. Returning the offsets the guard walked closes
+/// that gap — the extractor can only read what was validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseLayout {
+    /// `starts[i]` is the index in `tags` of layer `i`'s first projection.
+    starts: Vec<usize>,
+}
+
+impl DenseLayout {
+    /// Number of layers described.
+    pub fn num_layers(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// Index of layer `layer`'s first projection (`q_proj`).
+    ///
+    /// # Panics
+    /// If `layer >= num_layers()`. Callers iterate `0..num_layers()`.
+    pub fn layer_start(&self, layer: usize) -> usize {
+        self.starts[layer]
+    }
+
+    /// Index of layer `layer`'s `k`-th projection, in
+    /// `q, k, v, o, gate, up, down` order.
+    ///
+    /// # Panics
+    /// If `layer >= num_layers()` or `k >= DENSE_PROJS_PER_LAYER`. Both are
+    /// loop bounds at the only call site, so a panic here is a code defect, not
+    /// a bad model — a bad model is refused before this type exists.
+    pub fn proj(&self, layer: usize, k: usize) -> usize {
+        assert!(
+            k < DENSE_PROJS_PER_LAYER,
+            "projection {k} is out of range for a dense layer ({DENSE_PROJS_PER_LAYER} slots)"
+        );
+        self.starts[layer] + k
+    }
+}
 
 /// Refuse any model whose layer inventory is not the dense
 /// `q, k, v, o, gate, up, down` shape `DecodeConfig` describes.
@@ -120,11 +232,30 @@ impl std::error::Error for DenseShapeError {}
 /// 2. no *other* untagged entry appears at a position the extractor reads,
 ///    i.e. within `1 ..= num_layers * DENSE_PROJS_PER_LAYER`;
 /// 3. every layer index `0..num_layers` appears exactly
-///    [`DENSE_PROJS_PER_LAYER`] times, and no index outside that range appears.
+///    [`DENSE_PROJS_PER_LAYER`] times, and no index outside that range appears;
+/// 4. those entries are **contiguous and in ascending layer order**, starting at
+///    position 1.
 ///
-/// Part 3 is what actually protects the positional indexing: the extractor
-/// reads `layers[1 + i * 7 + k]`, which is only meaningful when every layer
-/// contributed exactly seven entries in order.
+/// Parts 3 and 4 together are what protects the positional indexing. Part 3
+/// alone does not: an inventory of `[lm_head, 1×7, 0×7]` satisfies it and is
+/// still mis-read, because the extractor takes positions `1..=7` to be layer 0.
+/// Part 4 is the half that was missing, and it is not hypothetical — it is the
+/// same failure mode as the count mismatch (a pointer set describing a model
+/// that does not exist) with none of the symptoms, since no bound is violated.
+///
+/// On success the walk's offset table is returned as a [`DenseLayout`] and the
+/// extractor indexes *that* rather than recomputing the stride, so the
+/// validated layout and the performed reads cannot drift apart.
+///
+/// # Per-layer kind, not one global constant
+///
+/// The rule is stated per layer and the refusal reports the whole model's
+/// distribution ([`LayerCensus`]). That matters for the models this actually
+/// meets: DeepSeek-V4 emits a *different* number of entries for a
+/// `MoeOrMlp::Mlp` layer (3) than for a `MoeOrMlp::Moe` layer
+/// (`get_isq_layers()`: shared experts + 3 per routed expert) in the same
+/// model (`deepseek4.rs:4931-4942`), so "the count for layer 0" is not the
+/// model's shape and must not be reported as though it were.
 ///
 /// # Part 2 is scoped to what is actually read
 ///
@@ -146,6 +277,14 @@ impl std::error::Error for DenseShapeError {}
 /// projections plus 256 experts x 3, not seven — and that is the truthful
 /// reason. The old rule reported the MTP head instead, because it happened to
 /// be checked first, which named a consequence rather than the cause.
+///
+/// Nor *should* it admit V4, and no amount of work on this function will: the
+/// refusal is downstream of a structural fact. [`LayerWeights`] has seven
+/// non-optional projection slots and `decode_forward` computes a fused-QKV
+/// attention followed by a `gate/up/silu/down` MLP. There is no MLA slot and no
+/// expert slot to put V4's weights in, so accepting V4 here would only move the
+/// failure from a named refusal to a wrong-tensor read. V4 needs a *layer kind*
+/// in `DecodeConfig`/`decode_forward`, not a looser guard.
 ///
 /// Pure, and deliberately not CUDA-gated, so the contract is unit-testable on
 /// any host — including the macOS dev machines where `cargo check` does not
@@ -169,7 +308,7 @@ impl std::error::Error for DenseShapeError {}
 pub fn check_dense_layer_inventory(
     tags: &[Option<usize>],
     num_layers: usize,
-) -> Result<(), DenseShapeError> {
+) -> Result<DenseLayout, DenseShapeError> {
     if num_layers == 0 {
         return Err(DenseShapeError::NoLayers);
     }
@@ -212,17 +351,70 @@ pub fn check_dense_layer_inventory(
         per_layer[idx] += 1;
     }
 
+    // The per-layer KIND, computed for every layer before anything is reported.
+    // A refusal that names only the first offending layer cannot distinguish a
+    // MoE architecture from one malformed layer in an otherwise dense model,
+    // and those want different responses from whoever reads the log.
+    let non_dense = per_layer
+        .iter()
+        .filter(|&&found| found != DENSE_PROJS_PER_LAYER)
+        .count();
+    let census = LayerCensus {
+        dense: num_layers - non_dense,
+        non_dense,
+    };
+
+    // Walk the block the extractor reads, layer by layer, in order — this is
+    // what turns a histogram into an offset table, and what catches blocks that
+    // have the right counts in the wrong places.
+    let mut starts = Vec::with_capacity(num_layers);
+    let mut position = 1usize;
     for (layer, &found) in per_layer.iter().enumerate() {
         if found != DENSE_PROJS_PER_LAYER {
             return Err(DenseShapeError::LayerProjCountMismatch {
                 layer,
                 found,
                 expected: DENSE_PROJS_PER_LAYER,
+                census,
+                num_layers,
             });
         }
+        starts.push(position);
+        for k in 0..DENSE_PROJS_PER_LAYER {
+            let at = position + k;
+            match tags.get(at).copied() {
+                // The only accepting arm.
+                Some(Some(idx)) if idx == layer => {}
+                Some(Some(idx)) => {
+                    return Err(DenseShapeError::LayerOutOfOrder {
+                        position: at,
+                        expected: layer,
+                        found: Some(idx),
+                    })
+                }
+                // Unreachable while every count is exactly seven (the untagged
+                // sweep above already covered `1..=last_read`), but the walk
+                // must be total: an inventory it cannot index is a refusal, not
+                // a panic.
+                Some(None) => {
+                    return Err(DenseShapeError::UntaggedInsideDenseBlock {
+                        position: at,
+                        last_read,
+                    })
+                }
+                None => {
+                    return Err(DenseShapeError::LayerOutOfOrder {
+                        position: at,
+                        expected: layer,
+                        found: None,
+                    })
+                }
+            }
+        }
+        position += DENSE_PROJS_PER_LAYER;
     }
 
-    Ok(())
+    Ok(DenseLayout { starts })
 }
 
 #[cfg(feature = "cuda")]
@@ -513,7 +705,6 @@ pub fn extract_model_weights(
     config: DecodeConfig,
 ) -> candle_core::Result<ModelWeights> {
     let num_layers = config.num_layers;
-    let projs_per_layer = DENSE_PROJS_PER_LAYER; // q, k, v, o, gate, up, down
 
     // ARCHITECTURE GUARD — must run before any pointer is taken.
     //
@@ -523,15 +714,21 @@ pub fn extract_model_weights(
     // the result is a pointer set for a model that does not exist — which the
     // decode kernels then execute without complaint. Refuse by name here rather
     // than produce silent garbage downstream. See the module docs.
+    //
+    // The guard hands back the offset table it walked. Indexing *that* rather
+    // than recomputing `1 + i * 7 + k` is the point: the layout that was
+    // validated and the reads that are performed are now the same object, so
+    // they cannot drift apart in a later edit.
     let tags: Vec<Option<usize>> = layers.iter().map(|(_, idx)| *idx).collect();
-    if let Err(e) = check_dense_layer_inventory(&tags, num_layers) {
-        candle_core::bail!(
+    let layout = match check_dense_layer_inventory(&tags, num_layers) {
+        Ok(layout) => layout,
+        Err(e) => candle_core::bail!(
             "dedicated decode path does not support this architecture: {e}. \
              The dense decode path (DecodeConfig/decode_forward) is only valid for \
              Llama-shaped models; it cannot describe MLA or MoE layers. This is a \
              refusal, not a failure — decode continues on the standard Candle path."
-        );
-    }
+        ),
+    };
 
     let mut anchors = WeightAnchors::default();
     anchors.residuals.reserve(residuals.len());
@@ -544,14 +741,13 @@ pub fn extract_model_weights(
     // Build layer weights from projections
     let mut layer_weights = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
-        let base = 1 + i * projs_per_layer;
-        let (q_proj, q_t) = quant_method_ptr(&**layers[base].0)?;
-        let (k_proj, k_t) = quant_method_ptr(&**layers[base + 1].0)?;
-        let (v_proj, v_t) = quant_method_ptr(&**layers[base + 2].0)?;
-        let (o_proj, o_t) = quant_method_ptr(&**layers[base + 3].0)?;
-        let (gate_proj, gate_t) = quant_method_ptr(&**layers[base + 4].0)?;
-        let (up_proj, up_t) = quant_method_ptr(&**layers[base + 5].0)?;
-        let (down_proj, down_t) = quant_method_ptr(&**layers[base + 6].0)?;
+        let (q_proj, q_t) = quant_method_ptr(&**layers[layout.proj(i, 0)].0)?;
+        let (k_proj, k_t) = quant_method_ptr(&**layers[layout.proj(i, 1)].0)?;
+        let (v_proj, v_t) = quant_method_ptr(&**layers[layout.proj(i, 2)].0)?;
+        let (o_proj, o_t) = quant_method_ptr(&**layers[layout.proj(i, 3)].0)?;
+        let (gate_proj, gate_t) = quant_method_ptr(&**layers[layout.proj(i, 4)].0)?;
+        let (up_proj, up_t) = quant_method_ptr(&**layers[layout.proj(i, 5)].0)?;
+        let (down_proj, down_t) = quant_method_ptr(&**layers[layout.proj(i, 6)].0)?;
         anchors.layers.push(LayerAnchors {
             qkv: vec![q_t, k_t, v_t],
             o: Some(o_t),
@@ -648,7 +844,7 @@ fn extract_layer_idx(name: &str) -> Option<usize> {
 /// `cargo check` does not type-check CUDA-gated code at all.
 #[cfg(test)]
 mod dense_shape_tests {
-    use super::{check_dense_layer_inventory, DenseShapeError, DENSE_PROJS_PER_LAYER};
+    use super::{check_dense_layer_inventory, DenseShapeError, LayerCensus, DENSE_PROJS_PER_LAYER};
 
     /// Exactly what `llama.rs` emits: the untagged lm_head, then `q, k, v, o`
     /// plus the MLP's `gate, up, down` for each layer.
@@ -662,9 +858,101 @@ mod dense_shape_tests {
 
     #[test]
     fn dense_llama_inventory_is_accepted() {
-        assert_eq!(check_dense_layer_inventory(&dense_tags(32), 32), Ok(()));
+        let layout = check_dense_layer_inventory(&dense_tags(32), 32)
+            .expect("a Llama-shaped inventory must be accepted");
+        assert_eq!(layout.num_layers(), 32);
         // The path must not require a *particular* depth, only the shape.
-        assert_eq!(check_dense_layer_inventory(&dense_tags(1), 1), Ok(()));
+        assert!(check_dense_layer_inventory(&dense_tags(1), 1).is_ok());
+    }
+
+    /// The layout is the check's product, and the extractor now reads *it*
+    /// rather than recomputing the stride. So assert the offsets it hands back
+    /// are the positions `extract_model_weights` must dereference — otherwise
+    /// the two agree only by coincidence, which is the arrangement this change
+    /// exists to end.
+    #[test]
+    fn accepted_layout_addresses_the_projections_the_extractor_reads() {
+        const NUM_LAYERS: usize = 5;
+        let tags = dense_tags(NUM_LAYERS);
+        let layout = check_dense_layer_inventory(&tags, NUM_LAYERS).expect("dense fixture");
+
+        for layer in 0..NUM_LAYERS {
+            assert_eq!(
+                layout.layer_start(layer),
+                1 + layer * DENSE_PROJS_PER_LAYER,
+                "layer {layer} start"
+            );
+            for k in 0..DENSE_PROJS_PER_LAYER {
+                let at = layout.proj(layer, k);
+                assert_eq!(at, 1 + layer * DENSE_PROJS_PER_LAYER + k);
+                // The decisive property: whatever index the layout produces,
+                // the entry there really does belong to that layer.
+                assert_eq!(tags[at], Some(layer), "layout.proj({layer}, {k}) -> {at}");
+            }
+        }
+    }
+
+    /// THE ORDERING HOLE. Both layers contribute exactly seven entries, so the
+    /// per-layer histogram — the whole of the old rule — accepts this. The
+    /// extractor then reads positions `1..=7` as layer 0 and gets layer 1's
+    /// projections, and every layer in the model is assigned another layer's
+    /// weights. Nothing is out of bounds, nothing faults, and decode returns
+    /// fluent nonsense.
+    ///
+    /// Mutation check: with the ordering walk removed and the histogram left in
+    /// place, this input returns `Ok` and the assertion below fails.
+    #[test]
+    fn blocks_in_the_wrong_order_are_rejected() {
+        let mut tags = vec![None];
+        tags.extend(std::iter::repeat_n(Some(1), DENSE_PROJS_PER_LAYER));
+        tags.extend(std::iter::repeat_n(Some(0), DENSE_PROJS_PER_LAYER));
+
+        // The fixture must actually defeat a histogram, or the test proves nothing.
+        let mut per_layer = [0usize; 2];
+        for &t in &tags {
+            if let Some(i) = t {
+                per_layer[i] += 1;
+            }
+        }
+        assert_eq!(
+            per_layer, [DENSE_PROJS_PER_LAYER; 2],
+            "fixture must pass a per-layer count rule"
+        );
+
+        let err =
+            check_dense_layer_inventory(&tags, 2).expect_err("out-of-order blocks must be refused");
+        assert_eq!(
+            err,
+            DenseShapeError::LayerOutOfOrder {
+                position: 1,
+                expected: 0,
+                found: Some(1),
+            }
+        );
+        assert!(err.to_string().contains("out of order"), "{err}");
+    }
+
+    /// The same hole in its interleaved form: counts are right, placement is
+    /// not. `[lm_head, 0, 1, 0, 1, ...]` gives each layer seven entries.
+    #[test]
+    fn interleaved_layer_blocks_are_rejected() {
+        let mut tags = vec![None];
+        for _ in 0..DENSE_PROJS_PER_LAYER {
+            tags.push(Some(0));
+            tags.push(Some(1));
+        }
+        let err =
+            check_dense_layer_inventory(&tags, 2).expect_err("interleaved blocks must be refused");
+        assert_eq!(
+            err,
+            DenseShapeError::LayerOutOfOrder {
+                // position 1 is layer 0's q_proj and is correct; position 2
+                // should be layer 0's k_proj and holds layer 1's q_proj.
+                position: 2,
+                expected: 0,
+                found: Some(1),
+            }
+        );
     }
 
     /// The case this guard exists for. `deepseek4.rs:4541-4600` emits, per
@@ -701,10 +989,60 @@ mod dense_shape_tests {
                 layer: 0,
                 found: 5 + experts * 3,
                 expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 0,
+                    non_dense: num_layers,
+                },
+                num_layers,
             }
         );
         // The message must name the reason; an operator reads this, not the enum.
         assert!(err.to_string().contains("MoE or MLA"), "{err}");
+        // ...and it must say the architecture is not dense, not merely that
+        // layer 0 is odd. `0/4 layers are dense` is the difference between
+        // "wrong model for this path" and "one layer needs looking at".
+        assert!(err.to_string().contains("0/4 layers are dense"), "{err}");
+    }
+
+    /// V4 is **heterogeneous**, which is the case a single global constant
+    /// cannot describe at all. `deepseek4.rs:4931-4942` emits three entries for
+    /// a `MoeOrMlp::Mlp` layer and `moe.get_isq_layers()` for a
+    /// `MoeOrMlp::Moe` layer, in the same model — so the count for layer 0 is
+    /// not the model's shape.
+    ///
+    /// Here layer 0 is dense-shaped by accident (7 entries) and the rest are
+    /// MoE. The refusal must still name the model, and the census is the only
+    /// field that can: it reports 1 dense of 3, so a reader can tell this from
+    /// a uniformly-MoE model without re-deriving the inventory.
+    #[test]
+    fn census_reports_the_whole_model_not_just_the_first_offending_layer() {
+        const NUM_LAYERS: usize = 3;
+        let mut tags = vec![None];
+        // Layer 0: exactly seven — accepted on its own terms.
+        tags.extend(std::iter::repeat_n(Some(0), DENSE_PROJS_PER_LAYER));
+        // Layers 1, 2: MLA + a small MoE.
+        for i in 1..NUM_LAYERS {
+            tags.extend(std::iter::repeat_n(Some(i), 5 + 4 * 3));
+        }
+
+        let err = check_dense_layer_inventory(&tags, NUM_LAYERS)
+            .expect_err("a heterogeneous MoE model must be refused");
+        assert_eq!(
+            err,
+            DenseShapeError::LayerProjCountMismatch {
+                // The first layer that is NOT dense — not layer 0.
+                layer: 1,
+                found: 17,
+                expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 1,
+                    non_dense: 2,
+                },
+                num_layers: NUM_LAYERS,
+            }
+        );
+        assert!(err.to_string().contains("1/3 layers are dense"), "{err}");
+        assert!(err.to_string().contains("2/3 are not"), "{err}");
     }
 
     /// The half of the old untagged rule that was load-bearing. An untagged
@@ -741,6 +1079,11 @@ mod dense_shape_tests {
                 layer: 0,
                 found: 29,
                 expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 0,
+                    non_dense: 1,
+                },
+                num_layers: 1,
             })
         );
     }
@@ -764,6 +1107,11 @@ mod dense_shape_tests {
                 layer: 0,
                 found: PER_LAYER,
                 expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 0,
+                    non_dense: 2,
+                },
+                num_layers: 2,
             })
         );
     }
@@ -802,6 +1150,11 @@ mod dense_shape_tests {
                 layer: 0,
                 found: PER_LAYER,
                 expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 0,
+                    non_dense: NUM_LAYERS,
+                },
+                num_layers: NUM_LAYERS,
             })
         );
     }
@@ -827,6 +1180,11 @@ mod dense_shape_tests {
                 layer: 0,
                 found: 8,
                 expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 0,
+                    non_dense: 2,
+                },
+                num_layers: 2,
             })
         );
     }
@@ -850,7 +1208,14 @@ mod dense_shape_tests {
         // MTP-style: h_proj, e_proj and a block, all untagged, all appended
         // after every position the extractor reads.
         tags.extend([None, None, None]);
-        assert_eq!(check_dense_layer_inventory(&tags, NUM_LAYERS), Ok(()));
+        let layout = check_dense_layer_inventory(&tags, NUM_LAYERS)
+            .expect("a trailing auxiliary head must not refuse a dense model");
+        assert_eq!(layout.num_layers(), NUM_LAYERS);
+        // Nothing the layout addresses reaches the appended head.
+        assert_eq!(
+            layout.proj(NUM_LAYERS - 1, DENSE_PROJS_PER_LAYER - 1),
+            last_read
+        );
     }
 
     #[test]
@@ -905,6 +1270,11 @@ mod dense_shape_tests {
                 layer: 1,
                 found: 0,
                 expected: DENSE_PROJS_PER_LAYER,
+                census: LayerCensus {
+                    dense: 1,
+                    non_dense: 1,
+                },
+                num_layers: 2,
             })
         );
     }

@@ -360,11 +360,20 @@ print(f'{n/w:.2f}' if w>0 and n>0 else 'n/a')")"
 
 # LEG A — production default. Establishes the inert baseline and the tok/s
 # denominator. Expect: ArcGraph INERT + capture_possible=false captured=0.
-LEG_ENV="ARC_NO_DEDICATED_DECODE=0"
+#
+# POLARITY. This leg used to set `ARC_NO_DEDICATED_DECODE=0` to mean "the
+# production default, i.e. not disabled". It did not mean that: `normal.rs`
+# tested the variable with `var_os(..).is_some()`, so `=0` disabled the
+# dedicated decode path just as surely as `=1` would have. LEG A and LEG B
+# therefore both ran with it off, and the baseline this leg exists to establish
+# was not the production default at all. The reader is fixed
+# (`normal.rs:env_flag_is_set`); the leg now sets nothing, which is the only
+# unambiguous spelling of "production default".
+LEG_ENV=""
 run_leg baseline || say "leg baseline did not complete"
 
 # LEG B — all three capture gates on, plus the profiler's three time channels.
-# ARC_NO_DEDICATED_DECODE is left OFF deliberately so the architecture guard's
+# ARC_NO_DEDICATED_DECODE is deliberately left UNSET so the architecture guard's
 # refusal line is exercised on the real V4 model.
 #
 # WARMUP SWEEP. The first run captured successfully and then died at

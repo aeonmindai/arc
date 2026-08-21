@@ -209,6 +209,57 @@ pub(crate) fn parse_alloc_cache_capacity(raw: Option<&str>) -> Option<usize> {
     })
 }
 
+/// Is `name` set to a value that means **yes**?
+///
+/// # This exists because presence-testing an on/off flag is a live bug class
+///
+/// `ARC_NO_DEDICATED_DECODE` was read as `var_os(..).is_some()`, so
+/// `ARC_NO_DEDICATED_DECODE=0` — the spelling any reader would take for "off" —
+/// *disabled* the dedicated decode path. Two A/B harnesses passed exactly that
+/// as their control leg (`arc-tools/arcgraph_heap_probe.sh`,
+/// `arc-tools/arcgraph_capture_probe.sh`), so both arms of both experiments ran
+/// with the path off and the variable under test cancelled out of the result.
+/// The experiments did not fail; they returned a difference of zero, honestly
+/// measured, for a comparison that was never made.
+///
+/// So flags are read by *value*, never by presence, and an unrecognised value
+/// is reported rather than silently bucketed — a typo in an ops script must not
+/// decide an experiment.
+///
+/// `1`, `true`, `yes`, `on` (any case, surrounding whitespace ignored) are yes.
+/// Unset, empty, `0`, `false`, `no`, `off` are no.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn env_flag_is_set(name: &str) -> bool {
+    let raw = std::env::var(name).ok();
+    match env_flag_value(raw.as_deref()) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                "{name}={:?} is not a recognised on/off value (use 1/0) — treating it as OFF. \
+                 Note that {name} is an opt-OUT: 1 disables, 0 and unset leave it enabled.",
+                raw.unwrap_or_default()
+            );
+            false
+        }
+    }
+}
+
+/// Pure half of [`env_flag_is_set`], so the polarity is testable without
+/// mutating process environment.
+///
+/// `None` means "value present but not recognised" — the caller decides what to
+/// do with that, and must not silently fold it into `false`.
+pub(crate) fn env_flag_value(raw: Option<&str>) -> Option<bool> {
+    let Some(raw) = raw else {
+        return Some(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "" | "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Emit the allocator's counters every `ARC_ALLOC_CACHE_STATS` decode steps.
 ///
 /// The counters are what this cache has to be judged on. A green log — the
@@ -1471,10 +1522,8 @@ impl Loader for NormalLoader {
         // It's a decode *speed* optimization only — gate it off via
         // ARC_NO_DEDICATED_DECODE=1 to reclaim that headroom. Default unchanged.
         #[cfg(feature = "cuda")]
-        let _decode_weights = if std::env::var_os("ARC_NO_DEDICATED_DECODE").is_some() {
-            tracing::info!(
-                "Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE set)."
-            );
+        let _decode_weights = if env_flag_is_set("ARC_NO_DEDICATED_DECODE") {
+            tracing::info!("Dedicated decode path extraction skipped (ARC_NO_DEDICATED_DECODE=1).");
             None
         } else if {
             // ARCHITECTURE GUARD, deliberately evaluated BEFORE the block below.
@@ -1493,7 +1542,12 @@ impl Loader for NormalLoader {
             let (layers_mut, _) = model.get_layers();
             let tags: Vec<Option<usize>> = layers_mut.iter().map(|(_, idx)| *idx).collect();
             match arc_cuda_graph::check_dense_layer_inventory(&tags, num_layers) {
-                Ok(()) => false,
+                // The layout is rebuilt (not carried) by `extract_model_weights`
+                // below: `get_layers()` is re-called there under a fresh borrow,
+                // and a layout that describes one call's vector must not be used
+                // to index another's. It is cheap to recompute and unsound to
+                // reuse, so it is recomputed.
+                Ok(_layout) => false,
                 Err(e) => {
                     tracing::warn!(
                         "Dedicated decode path declined (by design), before any weight was \
@@ -1503,7 +1557,7 @@ impl Loader for NormalLoader {
                         "decode.dedicated",
                         "the dense decode path refused this architecture; decode runs on the \
                          standard Candle path",
-                        "normal.rs:1268",
+                        "normal.rs:1544",
                     );
                     true
                 }
@@ -1582,7 +1636,7 @@ impl Loader for NormalLoader {
                             "decode.dedicated",
                             "the dense decode path refused this architecture; decode runs on the \
                              standard Candle path",
-                            "normal.rs:1318",
+                            "normal.rs:1630",
                         );
                     } else {
                         tracing::warn!(
@@ -1868,7 +1922,7 @@ impl Pipeline for NormalPipeline {
                             "cuda_graph.capture_probe",
                             "ARC_V4_CAPTURE_PROBE is unset, so capture/replay is skipped and the \
                              forward runs eagerly",
-                            "normal.rs:1554",
+                            "normal.rs:1922",
                         );
                     }
                     // Candle's caching allocator, driven by `alloc_cache_action`.
@@ -2308,14 +2362,19 @@ impl Pipeline for NormalPipeline {
     /// cuGraphLaunch on CUDA 12.4+, host-driven loop otherwise) and return
     /// the generated token IDs per sequence.
     ///
-    /// IMPORTANT: this method does NOT yet prime per-step paged attention
-    /// metadata into the runner — the engine must do that via a follow-up
-    /// hook before invoking this method. Until that wiring exists upstream,
-    /// the runner intentionally never finishes a real decode batch and the
-    /// engine continues to fall back to `step()`. The structural plumbing
-    /// (capture closure, accessors, response synthesis) is in place; the
-    /// remaining piece is the per-step input metadata bridge from the
-    /// engine's `PagedAttentionMeta` into `AutonomousDecodeRunner::prime_for_step`.
+    /// IMPORTANT: **capture is not wired, so this method never returns
+    /// `Some`.** The per-step metadata bridge this comment used to name as the
+    /// missing piece now exists — `prime_for_step` is called below, from the
+    /// engine's `AutonomousDecodeContext`. What is still missing is the
+    /// `paged_state_factory` that `AutonomousDecodeRunner::capture_via_decode_forward`
+    /// requires, and the `DedicatedDecodePath::has_cached_kv_info()` accessor
+    /// its precondition was meant to test. Neither exists; see the comment at
+    /// the unconditional `return Ok(None)` below for exactly what each needs.
+    ///
+    /// For DeepSeek-V4 none of that is reached in any case: `dedicated_decode`
+    /// is `None` (the dense-layer inventory refuses V4 at `normal.rs:1544`), so
+    /// the first guard in this method returns and every guard after it is dead
+    /// code on that model.
     #[cfg(feature = "cuda")]
     fn autonomous_decode(
         &mut self,
@@ -2331,7 +2390,24 @@ impl Pipeline for NormalPipeline {
             // Decision: require the dedicated decode path to be available.
             // Without it we have nothing to put in the capture closure
             // (Candle forward isn't graph-capturable in our current path).
+            //
+            // THIS GUARD CLOSES FIRST, and for DeepSeek-V4 it is the *only* one
+            // that ever evaluates. `dedicated_decode` is set at exactly one site
+            // (`normal.rs:1718`) and V4 is refused there by the dense-layer
+            // inventory, so every guard below — including the `cache_config`
+            // one, which our own notes blamed — is dead code on V4. That matters
+            // because those guards carry `mark_unreachable` calls: their absence
+            // from an ARC_PROFILE report is not evidence that they passed, it is
+            // evidence that control never reached them. Report from here so the
+            // first closing guard is the one that speaks.
             if self.dedicated_decode.is_none() {
+                arc_profiler::mark_unreachable(
+                    "cuda_graph.autonomous_decode",
+                    "the dedicated decode path is unavailable (normal.rs:1718 declined this \
+                     architecture, or ARC_NO_DEDICATED_DECODE=1), so there is no forward closure \
+                     to capture; every guard below this one is unreachable",
+                    "normal.rs:2403",
+                );
                 tracing::debug!(
                     "autonomous_decode: dedicated decode path unavailable; \
                      skipping autonomous capture (engine will use step-by-step decode)"
@@ -2388,11 +2464,18 @@ impl Pipeline for NormalPipeline {
             let block_size = match self.metadata.cache_config.as_ref() {
                 Some(c) => c.block_size,
                 None => {
+                    // NOT the V4 guard, despite what this used to claim. V4
+                    // cannot reach this line at all — `dedicated_decode` is
+                    // `None` for it and the guard at :2404 returned already. The
+                    // reason V4 never had a `cache_config` is real, but it is
+                    // not what closes the door on V4, and attributing it here
+                    // sent readers to `supports_paged_attention()` instead of to
+                    // the dense-layer inventory.
                     arc_profiler::mark_unreachable(
-                        "cuda_graph.autonomous_decode",
-                        "cache_config is None: DeepSeekV4Loader::supports_paged_attention() is \
-                         false, so no PagedAttention cache is ever built for V4",
-                        "normal.rs:1844",
+                        "cuda_graph.autonomous_decode.cache_config",
+                        "cache_config is None, so no PagedAttention cache exists to capture \
+                         against; the runner cannot be sized",
+                        "normal.rs:2464",
                     );
                     tracing::debug!("autonomous_decode: no cache_config, falling back");
                     return Ok(None);
@@ -2482,32 +2565,53 @@ impl Pipeline for NormalPipeline {
                 }
             }
 
-            // Capture the graph. We need disjoint mutable borrows of the
-            // dedicated path (for buffers) and the runner (for capture). Use
-            // a scope to split the borrow.
+            // ───────────────────────────────────────────────────────────────
+            // CAPTURE IS NOT WIRED. This return is unconditional, and it is
+            // guarding work that was described and never written — not a
+            // leftover. Removing it would call nothing, because the two things
+            // a call to `AutonomousDecodeRunner::capture_via_decode_forward`
+            // needs do not exist:
             //
-            // NOTE: paged_state_factory closes over the dedicated path's
-            // layer_caches via raw pointers — we cannot move the dedicated
-            // path itself into the closure. The factory must therefore only
-            // produce pointer-based state, which is what
-            // `build_paged_attn_state` returns once `cache_kv_info` has been
-            // populated. We trigger that via a stub PagedAttentionState built
-            // from default-zero ptrs on the first call; subsequent decode
-            // runs reuse the same captured graph so the pointers are stable.
+            //   1. `DedicatedDecodePath::has_cached_kv_info()`. The comment this
+            //      replaces said it was "added in the same change as the
+            //      accessor below". It was not — there is no such method on
+            //      `DedicatedDecodePath` anywhere in the workspace. The
+            //      precondition it was meant to test (has the dedicated path
+            //      seen a real `PagedAttentionState` yet, i.e. is
+            //      `cached_layer_caches` populated?) is therefore untested, and
+            //      the fall-back is unconditional instead of conditional.
             //
-            // BLOCKED: capturing here requires the engine to have already
-            // initialized `cache_engine` and called `forward_inputs` at
-            // least once so the dedicated path's `cached_layer_caches` is
-            // populated. We surface this by checking
-            // `dedicated.has_cached_kv_info()` (added in the same change as
-            // the accessor below); if not yet populated, we fall back. The
-            // engine's standard step() path will populate it during prompt
-            // prefill on its first call, so the autonomous path activates on
-            // the *second* batch onwards.
-            tracing::info!(
-                "autonomous_decode: runner allocated (batch={}, max_tokens={}, vocab={}). \
-                 Graph capture is deferred until the dedicated decode path's KV cache \
-                 layer pointers are populated (happens after first prompt step).",
+            //   2. The `paged_state_factory: Fn() -> PagedAttentionState` that
+            //      `capture_via_decode_forward` takes. `AutonomousDecodeContext`
+            //      carries only host-side per-row vectors (tokens, positions,
+            //      block tables, slot mappings) — no KV-cache device pointers
+            //      and no cache strides. Those are computed from the live
+            //      `CacheEngine` tensors at `pipeline/mod.rs:871`, inside
+            //      `try_dedicated_decode`, and are reachable here only via
+            //      `DedicatedDecodePath::build_paged_attn_state`, which needs
+            //      `&mut self` — while `self.autonomous_runner` is already
+            //      mutably borrowed for the capture. A `Fn()` closure over the
+            //      staged pointers is the missing piece; it is not a rename.
+            //
+            // Consequence: `capture` and `capture_via_decode_forward` have zero
+            // callers, `is_captured()` is permanently false, and the replay path
+            // below is dead. `arc-cuda-graph/src/lib.rs:171` already says this
+            // in prose; this records where the chain is actually cut.
+            //
+            // Reported so a profile shows the tier as dark rather than absent.
+            arc_profiler::mark_unreachable(
+                "cuda_graph.autonomous_decode.capture",
+                "capture is never attempted: DedicatedDecodePath::has_cached_kv_info() does not \
+                 exist and there is no paged_state_factory to hand to \
+                 AutonomousDecodeRunner::capture_via_decode_forward, so is_captured() stays false \
+                 and every decode falls back to the step-by-step path",
+                "normal.rs:2619",
+            );
+            tracing::warn!(
+                "autonomous_decode: runner allocated (batch={}, max_tokens={}, vocab={}) but \
+                 capture is NOT wired — capture_via_decode_forward has no caller and its \
+                 paged_state_factory does not exist. This runner will never capture; decode \
+                 falls back to the step-by-step path on every batch.",
                 bs,
                 config.max_tokens,
                 vocab_size,
@@ -2846,5 +2950,63 @@ mod alloc_cache_capacity_tests {
             Some(usize::MAX),
             "saturates instead of wrapping to a tiny cap"
         );
+    }
+}
+
+/// The env-flag polarity contract.
+///
+/// This is a bug class in this repo, not a hypothetical: `ARC_NO_DEDICATED_DECODE`
+/// was read as `std::env::var_os(..).is_some()`, so `=0` — the spelling that
+/// reads as "off" — turned the dedicated decode path *off*. Two A/B harnesses
+/// used exactly that spelling for their control leg
+/// (`arc-tools/arcgraph_heap_probe.sh`, `arc-tools/arcgraph_capture_probe.sh`),
+/// so both arms of both experiments ran with the path disabled and the variable
+/// under test cancelled out of the result. Nothing crashed and nothing logged a
+/// complaint; the experiments measured a comparison that had never been made.
+///
+/// The parse is pure so the polarity can be asserted without mutating the
+/// process environment, which every test in the binary shares.
+#[cfg(test)]
+mod env_flag_polarity_tests {
+    use super::env_flag_value;
+
+    /// THE REGRESSION. Under the old `var_os(..).is_some()` reading every one of
+    /// these was "set" and therefore "yes". A presence test cannot tell them
+    /// apart from `=1`, which is the whole defect.
+    #[test]
+    fn zero_and_its_spellings_are_off_not_merely_present() {
+        for off in ["0", "false", "no", "off", "OFF", " 0 ", "False", ""] {
+            assert_eq!(
+                env_flag_value(Some(off)),
+                Some(false),
+                "{off:?} must read as OFF; a presence test reads it as ON"
+            );
+        }
+    }
+
+    #[test]
+    fn one_and_its_spellings_are_on() {
+        for on in ["1", "true", "yes", "on", "ON", " 1 ", "True"] {
+            assert_eq!(env_flag_value(Some(on)), Some(true), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn unset_is_off() {
+        assert_eq!(env_flag_value(None), Some(false));
+    }
+
+    /// An unrecognised value is `None`, not `false`, so the caller can say so.
+    /// Silently bucketing a typo is how a mis-set flag decides an experiment
+    /// without anyone finding out.
+    #[test]
+    fn an_unrecognised_value_is_reported_rather_than_bucketed() {
+        for bad in ["2", "enabled", "-1", "y", "t", "disable"] {
+            assert_eq!(
+                env_flag_value(Some(bad)),
+                None,
+                "{bad:?} must be reported, not silently treated as on or off"
+            );
+        }
     }
 }

@@ -185,7 +185,14 @@ run_leg() { # $1 = name, $2 = extra env
 }
 
 # Q1 SCOPE: graphs fully OFF. No capture stream, no probe, no alloc cache.
-run_leg graphs_off "ARC_NO_DEDICATED_DECODE=0" || say "graphs_off leg did not complete"
+#
+# POLARITY. This leg used to pass `ARC_NO_DEDICATED_DECODE=0`, which reads as
+# "off" and was NOT: `normal.rs` tested the variable with `var_os(..).is_some()`,
+# so ANY value — `0` included — disabled the dedicated decode path. Both legs of
+# this A/B therefore ran with the path off and the comparison cancelled out. The
+# reader is fixed (`normal.rs:env_flag_is_set`), and this leg now says `=1`,
+# which is what "graphs fully OFF" always meant.
+run_leg graphs_off "ARC_NO_DEDICATED_DECODE=1" || say "graphs_off leg did not complete"
 
 # Q2 SITE: graphs ON, same tunables. Does the abort move earlier / elsewhere?
 run_leg graphs_on "ARC_CAPTURE_STREAM=1 ARC_V4_CAPTURE_PROBE=1 ARC_CANDLE_ALLOC_CACHE=1 ARC_GRAPH_WARMUP=8 ARC_GRAPH_DEFERRED_PASSES=3" \
