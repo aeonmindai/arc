@@ -1034,8 +1034,7 @@ fn fp8_blockwise_matmul_impl(
 
     match input.dtype() {
         DType::F16 => {
-            let output =
-                crate::arc_outbuf::alloc_out_fully_written::<f16>(&dev, (m * n) as usize)?;
+            let output = crate::arc_outbuf::alloc_out_fully_written::<f16>(&dev, (m * n) as usize)?;
 
             let input_s = match &*input_storage {
                 Storage::Cuda(cuda_storage) => cuda_storage.as_cuda_slice::<f16>()?,

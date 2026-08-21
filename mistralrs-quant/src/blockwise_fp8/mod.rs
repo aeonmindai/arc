@@ -555,18 +555,68 @@ pub fn blockwise_fp8_linear_b(
 /// Measured on an H200 against DeepSeek-V4-Flash at 512 prompt tokens: the
 /// cuBLASLt path is 27x faster on the MLA `q_proj`/`o_proj` projections
 /// (706.1 -> 26.2 ms/step) and 21x on the shared expert (253.2 -> 11.9), for
-/// 1.513x on prefill TTFT end to end. The default is set to that measured
-/// point rather than to an interpolated crossover.
+/// 1.513x on prefill TTFT end to end.
 ///
-/// The decode regime is untouched: it has its own dedicated `fp8_gemv_warp`
-/// kernel for M <= 4 and never reaches this threshold.
+/// # 🔴 THE DEFAULT WAS 512 BECAUSE 512 WAS THE ONLY POINT MEASURED
+///
+/// The previous doc said so outright — *"the default is set to that measured
+/// point rather than to an interpolated crossover"* — and 512 then became a
+/// wall. `fp8_gemv_warp` owns `M <= 4`, so **`M = 5..511` fell through to
+/// `fp8_matmul_tiled`**, the kernel whose own comment says there is *"no
+/// tensor-core instruction anywhere in it"*. A profile of the shipped default
+/// caught it running **7,525 times for 17.6% of GPU time** in one decode
+/// window.
+///
+/// Swept on an H200, V4-Flash, one binary and one env toggle, aggregate tok/s,
+/// **clean rows only** (>=95% achieved concurrency, <15% derived-vs-measured
+/// spread):
+///
+/// ```text
+///   M=1     34.92  vs  25.27   cuBLASLt 0.72x  -- the GEMV floor is REAL
+///   M=8     49.25  vs  64.95   cuBLASLt 1.32x
+///   M=16    45.61  vs  52.55   cuBLASLt 1.15x
+///   M=128  114.21  vs 130.76   cuBLASLt 1.14x
+/// ```
+///
+/// So the crossover is not 512; it is immediately above the GEMV's domain. The
+/// default is now **5** — the first row `fp8_gemv_warp` does not own.
+/// `M = 5..7` is **unmeasured**, bounded below by the GEMV domain and above by
+/// the +32% at M=8.
+///
+/// **Keep the floor.** At M=1 cuBLASLt is *worse* (0.72x): the dedicated
+/// `fp8_gemv_warp` kernel exists for a reason and forcing the library path over
+/// it costs 28% of b=1 decode. That row is why this constant is 5 and not 1.
+///
+/// **Mechanism, not just a number.** The tiled kernel is scalar, so its cost is
+/// instruction-bound and grows with M while the memory controller idles. The
+/// cuBLASLt path dequantizes once and hands a tensor-core GEMM the whole tile.
+/// The signature is visible in the counter: memory-controller utilisation went
+/// **2-3% -> 6-19%** across the sweep, the first intervention this session to
+/// move it at all. A scalar kernel that keeps the card 100% busy and the memory
+/// controller at 2% is not doing the work; it is doing arithmetic *about* the
+/// work.
+///
+/// # A recurring failure in this codebase: one measured point frozen as a gate
+///
+/// This is the **second** gate found this way. `qtip::gather_policy`'s tile-fill
+/// predicate required `6n/256 >= 16`, i.e. n >= 683, and so kept the amortizing
+/// grouped GEMM unreachable in every decode step; removing it was worth 1.45x
+/// at B=128. Both gates were derived from a single working point and neither
+/// was ever swept. **If you are about to set a dispatch threshold from one
+/// measurement, sweep it first and write down which rows were clean** — a
+/// threshold is a claim about every value it excludes, not just the one you
+/// tried.
+///
+/// `fp8_gemv_warp` still owns `M <= 4` and is not affected by this constant.
 ///
 /// `ARC_FP8_CUBLAS_MIN_M` overrides; a value above any real batch restores
 /// the previous always-native dispatch.
 #[cfg(feature = "cuda")]
 fn arc_fp8_cublas_min_m() -> usize {
     use std::sync::OnceLock;
-    const DEFAULT_MIN_M: usize = 512;
+    // 5 = the first row `fp8_gemv_warp` does not own. Swept, clean rows only;
+    // M=1 measured 0.72x for cuBLASLt, which is why this is not 1.
+    const DEFAULT_MIN_M: usize = 5;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var("ARC_FP8_CUBLAS_MIN_M")
