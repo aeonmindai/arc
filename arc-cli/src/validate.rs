@@ -18,6 +18,24 @@
 //!
 //! The output JSON is the contract that the rental verification step (and
 //! downstream CI) reads. Schema is intentionally narrow and stable.
+//!
+//! # Exit codes
+//!
+//! | code | meaning | who acts |
+//! |---|---|---|
+//! | `0` | measured, and it fits | nobody |
+//! | `1` | measured, and it does not fit | the model owner |
+//! | `2` | **not measured** — the run proves nothing | the operator |
+//!
+//! The third row is the whole point of [`hbm_verdict`]. A zero HBM delta —
+//! model loaded on the CPU, snapshots straddling a driver reset, free memory
+//! not going down — used to satisfy `0.0 <= target` and exit `0`, so this gate
+//! would certify "V4 fits in 60 GB on this H100" off a run where V4 never
+//! reached the H100. **A gate that cannot distinguish "it fits" from "we did
+//! not look" is worse than no gate**, because it manufactures the exact
+//! number a rental decision is made on. `2` is reserved for the environment,
+//! never `1`, so that a red lane always says whether to look at the model or
+//! at the box.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -93,8 +111,22 @@ pub struct HbmReport {
     pub target_gb: f64,
     /// Measured (or mocked) memory breakdown.
     pub measured: MeasuredFootprint,
-    /// True when measured.total_gb <= target_gb.
+    /// True when the run produced a usable measurement **and**
+    /// `measured.total_gb <= target_gb`.
+    ///
+    /// Never true when [`HbmReport::unmeasured`] is set: a run that measured
+    /// nothing has not shown that the model fits, and `0.0 <= target` is not
+    /// evidence of anything.
     pub pass: bool,
+    /// The run did not produce a usable measurement — the model never became
+    /// resident on the device.
+    ///
+    /// This is the difference between "V4 does not fit in 60 GB" and "we do
+    /// not know whether V4 fits in 60 GB", and it is the difference between
+    /// exit 1 and exit 2. `#[serde(default)]` so reports written before this
+    /// field existed still parse, as `false`.
+    #[serde(default)]
+    pub unmeasured: bool,
     /// "mock" or "gpu".
     pub mode: String,
     /// GPU descriptor (None for mock path).
@@ -230,6 +262,46 @@ fn estimate_kv_bytes() -> u64 {
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Convert bytes to gigabytes (binary GB).
+/// 🔴 Decide `(pass, unmeasured)` from one post-load HBM delta.
+///
+/// **A zero delta is an environment failure, not a pass.**
+///
+/// The real-GPU path computes `used_bytes = free_before.saturating_sub(
+/// free_after)`. If the model loaded on the CPU, or the two snapshots straddled
+/// a CUDA driver state reset, or free memory simply did not go down, that
+/// expression is `0` — and the verdict used to be `total_gb <= target`, i.e.
+/// `0.0 <= 60.0`, i.e. **true**. The gate printed `PASS` and exited `0`. That
+/// is this tool certifying "V4 fits in 60 GB on this H100" from a run in which
+/// V4 never touched the H100, and it is the worst failure a rental gate can
+/// have: the number it invents is the number a buying decision rests on. The
+/// zero case *was* detected — and pushed a free-form `note`. A note changes no
+/// exit code and nothing in CI reads one.
+///
+/// This lives outside `#[cfg(feature = "cuda")]` **on purpose**. The defect sat
+/// in CUDA-gated code that no CPU CI job ever compiled, let alone ran, so a
+/// test next to it would have been as unreachable as the bug. Keeping the
+/// decision in always-compiled code is what makes
+/// [`tests::zero_hbm_delta_is_unmeasured_not_a_pass`] able to fail on a laptop.
+pub fn hbm_verdict(used_bytes: u64, total_gb: f64, target_hbm_gb: f64) -> (bool, bool) {
+    let unmeasured = used_bytes == 0;
+    (!unmeasured && total_gb <= target_hbm_gb, unmeasured)
+}
+
+/// Process exit code for a finished report: `0` fits, `1` measured and does not
+/// fit, `2` we do not know.
+///
+/// Kept separate from [`run`] so the mapping is testable without a GPU, a
+/// model download, or stdout capture.
+pub fn exit_code(report: &HbmReport) -> i32 {
+    if report.unmeasured {
+        2
+    } else if report.pass {
+        0
+    } else {
+        1
+    }
+}
+
 fn to_gb(bytes: u64) -> f64 {
     bytes as f64 / GB
 }
@@ -280,6 +352,9 @@ pub fn run_mock(opts: &HbmValidateOptions) -> Result<HbmReport> {
             kv_estimate_gb: to_gb(kv_bytes),
         },
         pass,
+        // The mock path computes rather than measures, so it always produces a
+        // number. It can be wrong; it cannot be absent.
+        unmeasured: false,
         mode: "mock".to_string(),
         gpu: None,
         notes,
@@ -441,7 +516,7 @@ pub fn run_real_gpu(opts: &HbmValidateOptions) -> Result<HbmReport> {
     let weight_bytes = used_bytes.saturating_sub(workspace_bytes + kv_bytes);
 
     let total_gb = to_gb(used_bytes);
-    let pass = total_gb <= opts.target_hbm_gb;
+    let (pass, unmeasured) = hbm_verdict(used_bytes, total_gb, opts.target_hbm_gb);
 
     let mut notes = vec![
         format!(
@@ -457,10 +532,11 @@ pub fn run_real_gpu(opts: &HbmValidateOptions) -> Result<HbmReport> {
                 .unwrap_or("none")
         ),
     ];
-    if used_bytes == 0 {
+    if unmeasured {
         notes.push(
-            "WARN: post-load HBM delta is 0 — either the model loaded entirely on CPU \
+            "UNMEASURED: post-load HBM delta is 0 — either the model loaded entirely on CPU \
              (no device map?) or the snapshots straddle a CUDA driver state reset. \
+             This run proves nothing about residency; exit code is 2, not 0 or 1. \
              Inspect logs."
                 .to_string(),
         );
@@ -485,6 +561,7 @@ pub fn run_real_gpu(opts: &HbmValidateOptions) -> Result<HbmReport> {
             kv_estimate_gb: to_gb(kv_bytes),
         },
         pass,
+        unmeasured,
         mode: "gpu".to_string(),
         gpu: Some(GpuInfo {
             name: detect_gpu_name(),
@@ -574,7 +651,9 @@ pub fn run(opts: HbmValidateOptions) -> Result<i32> {
     println!("  total:     {:>7.2} GB", report.measured.total_gb);
     println!("  target:    {:>7.2} GB", report.target_gb);
     println!();
-    if report.pass {
+    if report.unmeasured {
+        println!("  result: UNMEASURED (no HBM was consumed — this run proves nothing)");
+    } else if report.pass {
         println!("  result: PASS (measured <= target)");
     } else {
         println!(
@@ -592,7 +671,16 @@ pub fn run(opts: HbmValidateOptions) -> Result<i32> {
     println!();
     println!("Report written to: {}", opts.output_path.display());
 
-    Ok(if report.pass { 0 } else { 1 })
+    // 0 = fits. 1 = measured, and does not fit. 2 = we do not know.
+    //
+    // The three must stay distinct. `1` is a verdict about the model and CI is
+    // entitled to act on it; `2` is a verdict about the run and means the
+    // operator has to look at the box. Collapsing "unmeasured" into `1` would
+    // read as "V4 does not fit" — the opposite error to the one this code used
+    // to make, and just as wrong. `2` also matches what `main.rs` already exits
+    // with for a bad `--compression-stack` or a load error, so callers need no
+    // new rule: **non-zero-and-not-1 means the environment, not the model.**
+    Ok(exit_code(&report))
 }
 
 #[cfg(test)]
@@ -776,6 +864,7 @@ mod tests {
                 kv_estimate_gb: 5.0,
             },
             pass: true,
+            unmeasured: false,
             mode: "mock".into(),
             gpu: None,
             notes: vec![],
@@ -814,6 +903,101 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert!(parsed.pass);
         assert_eq!(parsed.mode, "mock");
+    }
+
+    /// 🔴 **The regression this file exists to never repeat.**
+    ///
+    /// `used_bytes = free_before.saturating_sub(free_after)` is `0` whenever
+    /// the model did not become resident. The old verdict was
+    /// `pass = total_gb <= target` — `0.0 <= 60.0` — so the gate printed PASS
+    /// and exited 0 off a run in which nothing loaded onto the GPU.
+    ///
+    /// This test is in always-compiled code deliberately: the defect lived
+    /// inside `#[cfg(feature = "cuda")]`, which no CPU CI job compiles, so a
+    /// test next to the bug would have been as unreachable as the bug.
+    #[test]
+    fn zero_hbm_delta_is_unmeasured_not_a_pass() {
+        let (pass, unmeasured) = hbm_verdict(0, 0.0, 60.0);
+        assert!(
+            !pass,
+            "a zero HBM delta must never pass — 0.0 <= 60.0 is not evidence"
+        );
+        assert!(
+            unmeasured,
+            "a zero HBM delta must be reported as unmeasured"
+        );
+    }
+
+    /// The zero check must not swallow real results in either direction.
+    #[test]
+    fn nonzero_hbm_delta_is_judged_against_the_target() {
+        // 40 GiB measured against a 60 GB target: fits.
+        let used = 40 * 1024 * 1024 * 1024;
+        let (pass, unmeasured) = hbm_verdict(used, to_gb(used), 60.0);
+        assert!(pass && !unmeasured, "40 GiB must pass a 60 GB target");
+
+        // 80 GiB measured against the same target: a real failure, and it must
+        // stay distinguishable from "we did not look".
+        let used = 80 * 1024 * 1024 * 1024;
+        let (pass, unmeasured) = hbm_verdict(used, to_gb(used), 60.0);
+        assert!(!pass, "80 GiB must fail a 60 GB target");
+        assert!(
+            !unmeasured,
+            "80 GiB was measured — it is a model verdict, not an env one"
+        );
+
+        // Exactly on the line still passes; the contract is `<=`.
+        let (pass, _) = hbm_verdict(1, 60.0, 60.0);
+        assert!(pass, "the target is inclusive");
+    }
+
+    /// Exit codes must stay three-valued: 0 fits, 1 does not fit, **2 unknown**.
+    ///
+    /// Collapsing unknown into 1 would read as "V4 does not fit" — the opposite
+    /// error to the one this code used to make, and just as wrong.
+    #[test]
+    fn exit_code_separates_the_model_verdict_from_the_environment() {
+        let mk = |pass: bool, unmeasured: bool| HbmReport {
+            model: "m".into(),
+            compression_stack: "bf16".into(),
+            target_gb: 60.0,
+            measured: MeasuredFootprint {
+                total_gb: 0.0,
+                weight_gb: 0.0,
+                workspace_gb: 0.0,
+                kv_estimate_gb: 0.0,
+            },
+            pass,
+            unmeasured,
+            mode: "gpu".into(),
+            gpu: None,
+            notes: vec![],
+        };
+        assert_eq!(exit_code(&mk(true, false)), 0, "fits");
+        assert_eq!(exit_code(&mk(false, false)), 1, "measured, does not fit");
+        assert_eq!(exit_code(&mk(false, true)), 2, "unmeasured");
+        // Belt and braces: even a report that somehow claims both must not
+        // report success, because `unmeasured` is the stronger statement.
+        assert_eq!(exit_code(&mk(true, true)), 2, "unmeasured wins over pass");
+    }
+
+    /// An older report on disk, written before `unmeasured` existed, must still
+    /// parse — the JSON file is a cross-version contract with the rental step.
+    #[test]
+    fn reports_without_the_unmeasured_field_still_parse() {
+        let legacy = r#"{
+            "model": "deepseek-ai/DeepSeek-V4-Flash",
+            "compression_stack": "qtip2+td-moe",
+            "target_gb": 60.0,
+            "measured": {"total_gb": 55.0, "weight_gb": 50.0, "workspace_gb": 4.0, "kv_estimate_gb": 1.0},
+            "pass": true,
+            "mode": "gpu",
+            "gpu": null,
+            "notes": []
+        }"#;
+        let parsed: HbmReport = serde_json::from_str(legacy).expect("legacy report parses");
+        assert!(parsed.pass);
+        assert!(!parsed.unmeasured, "absent means false, not unknown");
     }
 
     #[test]
