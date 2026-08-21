@@ -183,6 +183,46 @@ extern "C" {
         stream: candle_core::cuda::cudarc::driver::sys::CUstream,
     );
 
+    // ---- Wide (128-bit-load) FP8 GEMV. Same decode regime as
+    // `launch_fp8_gemv_*` above, but 16 bytes of weight per thread per load
+    // instead of 4, software-pipelined so two iterations are always in
+    // flight, and `scale_shift` (= log2(block_size_x)) in place of the
+    // runtime integer division the 32-bit kernel does once per four weight
+    // bytes. See the kernel header in
+    // `kernels/blockwise_fp8/blockwise_fp8_gemm.cu`.
+    //
+    // 🔴 UNVERIFIED ON HARDWARE — never run. Opt-in via `ARC_FP8_GEMV_WIDE=1`.
+    // NOT bit-identical to `launch_fp8_gemv_*`: it re-associates the f32
+    // accumulation (four accumulators per lane instead of one) over an
+    // identically-computed set of 4-element groups.
+    pub(crate) fn launch_fp8_gemv_wide_f16(
+        input: *const f16,
+        weight: *const F8E4M3,
+        weight_scale: *const f32,
+        output: *mut f16,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale_row_stride: i32,
+        block_size_y: i32,
+        scale_shift: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
+    pub(crate) fn launch_fp8_gemv_wide_bf16(
+        input: *const bf16,
+        weight: *const F8E4M3,
+        weight_scale: *const f32,
+        output: *mut bf16,
+        m: i32,
+        n: i32,
+        k: i32,
+        scale_row_stride: i32,
+        block_size_y: i32,
+        scale_shift: i32,
+        stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    );
+
     // FP8 Indexed MoE GEMM kernels (for gather_forward method)
     pub(crate) fn launch_fp8_indexed_moe_gemm_f16(
         input: *const f16,

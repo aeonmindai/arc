@@ -58,6 +58,30 @@ extern "C" void launch_fp8_gemv_bf16(const __nv_bfloat16 *input,
                   "capability >= 8.0)\n");
 }
 
+// Wide (128-bit-load) GEMV — see `fp8_gemv_wide` in blockwise_fp8_gemm.cu.
+// `HAVE_BLOCKWISE_GEMM_KERNELS` is false on CC < 8.0 so Rust never calls
+// these, but the `extern "C"` declarations still need a symbol to link.
+extern "C" void launch_fp8_gemv_wide_f16(const __half *input,
+                                         const void *weight, // __nv_fp8_e4m3*
+                                         const float *weight_scale,
+                                         __half *output, int M, int N, int K,
+                                         int scale_row_stride, int block_size_y,
+                                         int scale_shift, cudaStream_t stream) {
+  fprintf(stderr, "FP8 wide GEMV not supported on this GPU (requires compute "
+                  "capability >= 8.0)\n");
+}
+
+extern "C" void
+launch_fp8_gemv_wide_bf16(const __nv_bfloat16 *input,
+                          const void *weight, // __nv_fp8_e4m3*
+                          const float *weight_scale, __nv_bfloat16 *output,
+                          int M, int N, int K, int scale_row_stride,
+                          int block_size_y, int scale_shift,
+                          cudaStream_t stream) {
+  fprintf(stderr, "FP8 wide GEMV not supported on this GPU (requires compute "
+                  "capability >= 8.0)\n");
+}
+
 extern "C" void launch_fp8_indexed_moe_gemm_f16(
     const __half *input,
     const void *weights, // __nv_fp8_e4m3*

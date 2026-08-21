@@ -3,6 +3,7 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
 use candle_nn::Linear;
 
+pub(crate) mod gemv_wide;
 mod ops;
 pub use ops::{fp8_blockwise_dequantize, fp8_blockwise_quantize, mx_int4_blockwise_dequantize};
 #[cfg(feature = "cuda")]
