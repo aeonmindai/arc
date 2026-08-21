@@ -796,7 +796,7 @@ mod tests {
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
-        Ok((a - b)?.abs()?.max_all()?.to_scalar::<f32>()?)
+        (a - b)?.abs()?.max_all()?.to_scalar::<f32>()
     }
 
     /// **The mathematical claim behind the flatten, and the measurement of what
