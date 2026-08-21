@@ -1,0 +1,296 @@
+{
+  "_README": "Arc ceilings + quality model. READ BEFORE quoting any speed or quality number, or before concluding anything is 'not achievable'. Every number here is either PHYSICS (a bound reality imposes) or IMPLEMENTATION (a statement about today's code). Confusing the two is the single most repeated mistake in this project's history. Companion files: FACTS.md (measured only), DOCTRINE.md (standing rules), STATUS.md (now).",
+  "version": "1.0",
+  "created": "2026-08-15",
+  "author_note": "Written after Jish corrected Fable for (a) inflating the dense term 4x and understating the b=1 ceiling, (b) presenting uniform-routing lower bounds as ceilings, (c) repeating '15% of peak' as though it were a constraint.",
+  "MISSION": {
+    "statement": "Get more real work out of the compute that already exists. Every token Arc serves more efficiently is silicon that does not need to be built, powered, or cooled.",
+    "why_it_matters": "AI inference is a growing share of datacenter energy draw. Serving the same traffic on a fraction of the hardware is a direct cut to electricity and to the embodied carbon of GPUs that never get manufactured. This is not a side effect of the engineering — it IS the product thesis, expressed in physics.",
+    "jish_verbatim_2026_08_15": "we're changing the world... turning AI a bit more eco friendly and cutting carbon from the world. We can be anything but pessimistic in this project, we cannot lose, to nobody.",
+    "jish_verbatim_2026_08_12": "Arc's wedge isn't local llms bro. not single user single gpu huge model, its still datacenters serving llms, but the same 80 nodes of H200s can serve a shit ton of more capacity than they originally did and far cheaper + efficiently than they originally did",
+    "the_proof_already_in_hand": "Every published DeepSeek-V4-Flash config needs 4x H200. Arc runs it on 1. That is a 4x cut in silicon, power and embodied carbon for the same model, and it is measured, published and verified — not projected."
+  },
+  "ANTI_PESSIMISM_PROTOCOL": {
+    "core_rule": "A measured number describes TODAY'S CODE. It is never evidence about what is possible. Only physics bounds what is possible.",
+    "before_writing_the_words_not_achievable": [
+      "1. Is this a PHYSICS bound (bytes that must move / bandwidth / arithmetic that must happen)? If not, it is an engineering task, and say so.",
+      "2. Have I extrapolated past the edge of the sampled data? Compute four more rows of the formula before concluding a trend.",
+      "3. Am I quoting a % of peak? Someone else's implementation reaching higher is proof ours is not at a limit. EXL3 reaches ~80% for this exact format; 15% is a verdict on our kernel, not on the format.",
+      "4. Did I check what a reference implementation achieves? If not, I have an opinion, not a finding.",
+      "5. Is a worst-case assumption hiding in my model (e.g. uniform routing)? Say which direction it biases."
+    ],
+    "fables_recorded_pessimism_failures_2026_08_15": [
+      {
+        "claim": "MoE batch economics are structurally modest, ~1.57x",
+        "why_wrong": "Stopped computing at B=32 because that is where our data stopped. Four more rows show expert coverage saturates and amortization reaches 6x at B=256.",
+        "caught_by": "Jish"
+      },
+      {
+        "claim": "b=1 ceiling ~560 tok/s",
+        "why_wrong": "Guessed the dense term at 7 GB; it is 1.70 GB. Real ceiling is ~1413 tok/s. Jish's 640 was CONSERVATIVE.",
+        "caught_by": "Jish"
+      },
+      {
+        "claim": "GEMV at 15% of peak (stated as a constraint)",
+        "why_wrong": "Our own FACTS records EXL3 at ~80% for this format. 15% is our implementation. The computed codebook measured 3.86-4.03x on the decode GEMV, which lands near 60%.",
+        "caught_by": "Jish"
+      },
+      {
+        "claim": "0.2% of roofline",
+        "why_wrong": "The roofline itself was overstated ~8x by assuming all weights are read every step at small batch.",
+        "caught_by": "agent AY"
+      },
+      {
+        "claim": "Paged attention is the keystone unlocking three capabilities",
+        "why_wrong": "Infeasible for V4 AND insufficient — the prime_for_step bridge does not exist.",
+        "caught_by": "agent BC"
+      },
+      {
+        "claim": "The CPU sampler fallback is the prime suspect for the throughput collapse",
+        "why_wrong": "Probe sends temperature=0 -> greedy path returns before the radix branch. Explains 0%.",
+        "caught_by": "agent AY"
+      }
+    ],
+    "the_discipline_that_survives": "Optimism about what is POSSIBLE. Ruthlessness about what is MEASURED. Never soften a bad measurement, never accept it as a ceiling. Report the gap AND the physics bound in the same breath, so the gap reads as work to do rather than as a verdict."
+  },
+  "MODEL_CONSTANTS": {
+    "model": "DeepSeek-V4-Flash",
+    "params_total": 284000000000.0,
+    "params_active_per_token": 13000000000.0,
+    "num_experts": 256,
+    "experts_per_token": 6,
+    "_note_top6": "TOP-6, NOT top-8. Fable used top-8 and overstated every amortization row.",
+    "artifact_bytes": 74190197268,
+    "bits_per_param": 2.09,
+    "_note_bpw": "2.09, NOT 1.9. The 1.9 came from dividing by a 68 GB ESTIMATE instead of the real 74.19 GB.",
+    "bytes_per_param": 0.26125,
+    "derivation_of_split": "256*P + D = 284e9 ; D + 6*P = 13e9  =>  P = 1.084e9 params/expert, D = 6.496e9 dense params",
+    "bytes_per_expert": 283200000,
+    "bytes_dense": 1697000000,
+    "sanity_check": "1.697 GB dense + 6 * 0.2832 GB = 3.396 GB = exactly 13e9 active params * 0.26125 B/param. Consistent."
+  },
+  "HARDWARE": {
+    "H200": {
+      "hbm_bytes": 141000000000.0,
+      "bandwidth_bytes_per_s": 4800000000000.0,
+      "cost_per_hour_usd": 4.85
+    },
+    "A100_80G": {
+      "hbm_bytes": 80000000000.0,
+      "bandwidth_bytes_per_s": 2039000000000.0,
+      "cost_per_hour_usd": 1.49
+    }
+  },
+  "SPEED_MODEL": {
+    "formula_distinct_experts": "E(B) = 256 * (1 - (1 - 6/256)^B)",
+    "formula_bytes_per_step": "bytes(B) = 1.697e9 + E(B) * 0.2832e9",
+    "formula_step_seconds": "t(B) = bytes(B) / 4.8e12",
+    "formula_per_user_tok_s": "1 / t(B)",
+    "formula_aggregate_tok_s": "B / t(B)",
+    "_CRITICAL_CAVEAT": "E(B) assumes UNIFORM RANDOM routing, which MAXIMISES distinct experts for a given B. Any real-world routing concentration wakes FEWER experts, reads FEWER bytes, and lands ABOVE these numbers. THESE ARE LOWER BOUNDS ON THE CEILING, NOT CEILINGS. The real coverage curve has never been measured on this model — measuring it is cheap and unclaimed.",
+    "table": [
+      {
+        "B": 1,
+        "experts_woken": 6.0,
+        "bytes_per_step_GB": 3.4,
+        "step_ms": 0.71,
+        "ceiling_per_user_tok_s": 1413,
+        "ceiling_aggregate_tok_s": 1413
+      },
+      {
+        "B": 8,
+        "experts_woken": 43.9,
+        "bytes_per_step_GB": 14.13,
+        "step_ms": 2.94,
+        "ceiling_per_user_tok_s": 340,
+        "ceiling_aggregate_tok_s": 2721
+      },
+      {
+        "B": 16,
+        "experts_woken": 80.2,
+        "bytes_per_step_GB": 24.41,
+        "step_ms": 5.09,
+        "ceiling_per_user_tok_s": 197,
+        "ceiling_aggregate_tok_s": 3144
+      },
+      {
+        "B": 32,
+        "experts_woken": 135.3,
+        "bytes_per_step_GB": 40.01,
+        "step_ms": 8.34,
+        "ceiling_per_user_tok_s": 120,
+        "ceiling_aggregate_tok_s": 3837
+      },
+      {
+        "B": 64,
+        "experts_woken": 199.1,
+        "bytes_per_step_GB": 58.08,
+        "step_ms": 12.1,
+        "ceiling_per_user_tok_s": 83,
+        "ceiling_aggregate_tok_s": 5289
+      },
+      {
+        "B": 128,
+        "experts_woken": 243.4,
+        "bytes_per_step_GB": 70.63,
+        "step_ms": 14.71,
+        "ceiling_per_user_tok_s": 68,
+        "ceiling_aggregate_tok_s": 8701
+      },
+      {
+        "B": 256,
+        "experts_woken": 255.4,
+        "bytes_per_step_GB": 74.02,
+        "step_ms": 15.42,
+        "ceiling_per_user_tok_s": 65,
+        "ceiling_aggregate_tok_s": 16602
+      }
+    ],
+    "headline_ceiling": "ONE H200 can in principle serve ~16,600 tok/s aggregate at B=256. That is the fleet number. It is physics, not a projection.",
+    "PAST_SATURATION_EVERY_EXTRA_USER_IS_NEARLY_FREE": {
+      "why": "Once E(B) reaches ~256 of 256 experts, bytes/step stops growing (74 GB is the whole model). Step time pins at ~15.4 ms. Aggregate = B / 0.0154 and therefore scales ~LINEARLY with B from there. This is the single most important shape in the whole model and Fable missed it for a day by only tabulating to B=256.",
+      "B_384": 24900,
+      "B_512": 33200,
+      "B_699": 45400,
+      "_units": "aggregate tok/s ceiling on ONE H200",
+      "🔴_CORRECTION_2026_08_16": "These rows are BANDWIDTH-ONLY and the tail ignores the FLOP bound. Bandwidth and compute cross at B≈415, so B_699 should read ~27,000, not 45,400. B_512 is near the crossover; treat it as an upper bound. THE 16,600 HEADLINE AT B=256 IS UNAFFECTED — it sits well below the crossover. (wave44-BV)",
+      "what_gates_it": "MEMORY FOR CONTEXT, not bandwidth. Per-token context bytes decide max B. See KV_AND_XS_LADDER."
+    },
+    "KV_AND_XS_LADDER": {
+      "_note": "Each row is the per-token context cost and the max concurrent users it allows in ~65 GB at 2048-token context. This ladder, not the kernel, is what sets the fleet number.",
+      "2026_08_15_morning": {
+        "bytes_per_token": 424018,
+        "max_B": 68,
+        "note": "xs carried raw"
+      },
+      "after_PR59_rolling_xs": {
+        "bytes_per_token": 108288,
+        "max_B": 266,
+        "note": "xs 60.7x cut; attention KV becomes 81% of the budget"
+      },
+      "after_PR63_kv_dedup": {
+        "bytes_per_token": 64342,
+        "max_B": 493,
+        "note": "K and V were stored SEPARATELY at BF16 though V4's fused wkv makes them IDENTICAL (deepseek4.rs:1459 `let v = k.copy()?`). 2048 -> 1026 B/token/layer. Reference stores 584."
+      },
+      "with_FP8_K_storage": {
+        "bytes_per_token": 45594,
+        "target_per_layer": 590,
+        "max_B": 696,
+        "note": "MEASURED-BY-DESIGN 2026-08-16 (wave43-BU, PR #72), 16/16 CI green. Bit-exact CONFIRMED: act_quant_kv_nope (deepseek4.rs:2264-2306) already E4M3-round-trips K's 448 nope dims in 64-wide blocks, then WIDENS BACK to BF16 at :2304 and stores that. Storing the E4M3 codes instead is bitwise identical.",
+        "🔴_correction": "BK's 586 target would have been LOSSY. The reference's 7 UE8M0 scale bytes are a DIFFERENT scale. Bit-exactness requires storing the block amax at ACTIVATION precision — free, because the amax IS one of the block's own elements. Hence 590 B/token/layer, not 586, and max B ~696 not 699.",
+        "how_it_dodges_PagedAttention": "New models/dsv4_kv_fp8.rs stores codes as U8 in the K half and [rope ++ amax] in the V half of the existing KvCache::Normal slot. 'ZERO changes to cache infrastructure' was WRONG — see status. U8 + index_select LUT rather than DType::F8E4M3 because candle has no CUDA F8E4M3 cast. Needs Dsv4AttentionConfig::raw_prefix so decode reconstructs only the 128 reachable columns — without it the dequant writes ~63 GB/step at B≈700 and LOSES more than it saves.",
+        "🔴_status_2026-08-16_wave49-BZ": "NOT SHIPPED-ON. PR #72 defaulted this ON and was merged without the GPU run its own author asked for; the first V4 forward on a commit containing it returned finish_reason:error on 3/3 prompts with 'dtype mismatch in slice-set, lhs: BF16, rhs: U8' (wave48-BY). NOW OPT-IN: OFF unless ARC_V4_FP8_KV=1. The 45,594 B/token and max_B 696 are what you get WITH the flag, not what master runs. Root cause was NOT the FP8 layout: the engine preallocates a BF16 [1,1,cap,head_dim] buffer as SingleCache.all_data before the first append (engine/add_request.rs:464 -> kv_cache/mod.rs:802 under CacheInstruction::Reset{load_preallocated_cache:true}), and slice_set demands an exact dtype+width match. Fixed in SingleCache::append. THE SAME BUG ALSO BROKE THE DEFAULT wave33 LAYOUT ('shape mismatch on dim 3, 512 <> 1' from the 1-wide V marker), hidden behind the FP8 one because candle checks dtype before shape — so 'just set ARC_V4_FP8_KV=0' would NOT have rescued the box.",
+        "needs_gpu": "STILL UNRUN, and it is the only thing between opt-in and default-on: index_select over the 256-entry LUT with U32 indices, and the U8 H2D leg, have never executed on CUDA. (The U8 SingleCache itself is now exercised on CPU.) Decisive cheap check: greedy generation with ARC_V4_FP8_KV=1 vs unset must produce IDENTICAL tokens. ~15 min inside any existing V4 rental, no re-bake, no separate rental justified."
+      }
+    },
+    "jish_640_target": "640 tok/s single-user is ~45% of the 1413 physics ceiling. CONSERVATIVE AND REACHABLE. Fable's earlier '560 ceiling' was arithmetic error.",
+    "levers_that_BEAT_the_table": {
+      "MTP_speculative_decode": "✅ WORKS AT EVERY BATCH SIZE as of 2026-08-16 (wave45-BW, PR #73). Supersedes BOTH earlier claims — 'B=1 only' and 'mutually exclusive with PagedAttention' are now WRONG. **JISH WAS RIGHT to reject the exclusivity**: it is an UNIMPLEMENTED BRANCH, not an incompatibility, and it is MOOT for V4 twice over (supports_paged_attention→false; mtp_decode_kit has one impl). **The guard has never fired.** SGLang does exactly this rollback (eagle_info.py:488-490) and at topk==1 — which is what DeepSeek MTP IS — it is PURE TRUNCATION, ZERO KV MOVEMENT. Paged KV is the BETTER substrate. **The real B=1 gate was a CACHE constraint, not MTP**: single_cache.rs:161 `append` does slice_set with ONE offset for the whole batch. Solved by keeping CACHE lengths uniform while TOKEN lengths diverge; drafting groups by uncached-tail u into ≤depth+1 groups; rollback to C + min(u_i + a_i). 🔑 **AND MTP COULD NEVER HAVE HELPED BEFORE THIS**: the old shape ran TWO full target forwards per step, capping the multiplier at (depth+1)/2 — so `--mtp-depth 1` was mathematically incapable of beating no-MTP. Fused ⇒ ×2 at every depth. PROJECTION (labelled, nothing measured): draft overhead 1+depth/43. k=2 ⇒ ×1.91 ⇒ **B=64: 159, B=128: 130 tok/s per user**. k=3 ⇒ ×2.80 ⇒ 232 / 190. **k=2 CLEARS JISH'S 100-AT-ANY-BATCH TARGET ON ONE CARD** — expert parallelism is not required for that goal. Reference's non-simulated V4 acceptance floor is k=2.30 (test_dsv4_pro_mtp.py:261). STILL UNMEASURED. Command in RUNBOOK_8 §S3c, runs inside any existing rental.",
+      "routing_concentration": "Real routing wakes fewer than E(B) experts. Unmeasured. Direction is favourable.",
+      "further_compression": "🔴 rANS MEASURED AND REFUTED 2026-08-16 (wave43-BU) — do not reopen without new evidence. On the REAL artifact (qtip2-7.uqff whole, 1.074B symbols): order-0 symbol entropy 3.99987 of 4.0 bits = **0.003% saving**; order-1 0.024%; order-2 0.259%. Per-row framing needed to keep random access costs **+0.78%** — 150-250x the entropy recovered. **rANS makes the artifact BIGGER before any decode cost.** The trellis indices are already ~maximum-entropy, which is what a good quantizer should produce. REAL wins surfaced instead: F32 row_scales are 0.77% of a layer (BF16 => ~0.39% free), and the 'shared' LUT is written PER LAYER (~90 MB duplicated).",
+      "multi_gpu_EXPERT_PARALLEL": "🔑 MEASURED-BY-DESIGN (wave44-BV, PR #70): shard the 256 experts across N cards; each reads only its slice. **The saturated per-user floor goes 65 (N=1) → 126 (N=2) → 193 (N=4) → 303 (N=8) at B=128.** ⇒ **TWO CARDS CLEAR JISH'S 100 tok/s-per-user TARGET AT ANY BATCH.** Eight are not needed to start. Comms does NOT eat the win on NVLink (222 MB/step at N=4, 4.5-13% of the step) — the cost is LATENCY: 86 collectives/step ≈ 0.86 ms, 3× the bandwidth term. ⚠️ **EP IS NVLINK-ONLY**: on PCIe/InfiniBand comms becomes 62% of the step and the N=8 win collapses 4.5× → 2.6×. `nvidia-smi topo -m` is a hard preflight. Load imbalance is SELF-BOUNDED here (+4.2% at B=128) because a GPU cannot read more experts than it owns — skip EPLB in stage 1, instrument for it. EP + data-parallel attention beats TENSOR parallel, because V4's K/V is one fused MQA head so TP duplicates the KV cache — the binding constraint. Stage 1 = EP=2 on one NVLink node, ~2 h, $15-20.",
+      "⚠️_Fable_error": "Fable projected 543 tok/s per user at N=8. WRONG — it assumed the DENSE term shards. It is REPLICATED on every card. Correct pre-comms N=8 is 465, post-comms 303.",
+      "MTP_MEASURED_2026_08_16": "🟢 **FIRST ACCEPTANCE MEASUREMENT IN THIS PROGRAM'S HISTORY** (wave51-CB, H200, qtip2b artifact). **accept_rate ≈ 0.42 aggregate (27 accepted / 64 proposed); tok_per_step ≈ 1.84 (59 committed over 32 steps).** Per-request spread 0.35–0.50. ⇒ **k ≈ 1.84, NOT the k=2 Fable had been projecting from.** At B=128 the per-user CEILING is 68 tok/s ⇒ 1.84×68 = **~125 tok/s/user — still clears Jish's 100 target, with less margin than the 130 previously quoted.** ⚠️ **SAMPLE IS TINY** — 32 steps, 64 proposals. The reference's published non-simulated V4 floor is **2.30**. Our 1.84 could be sample noise, a shorter draft depth, or genuinely lower acceptance on these prompts. **First measurement, not a settled number — re-measure at scale.** ⚠️ And it multiplies a number far below its own bound: measured per-user at B=128 is **1.09 tok/s** today, ~60× under the 68 ceiling. MTP is a multiplier on whatever the base path achieves — fix the base first. Three prior sessions collected EMPTY files here; the mechanism, the counters and the plumbing are now all confirmed working."
+    }
+  },
+  "MEASURED_VS_CEILING": {
+    "_source": "wave26-AX, 2026-08-15, 1xH200, in-situ W=32 bake (NOT the published W=256 artifact - state this whenever comparing)",
+    "rows": [
+      {
+        "B": 1,
+        "measured_per_user": 15.11,
+        "ceiling_per_user": 1413,
+        "gap_x": 93
+      },
+      {
+        "B": 32,
+        "measured_aggregate": 5.07,
+        "ceiling_aggregate": 3837,
+        "gap_x": 757
+      },
+      {
+        "B": 64,
+        "measured_aggregate": 8.14,
+        "ceiling_aggregate": 5289,
+        "gap_x": 650
+      }
+    ],
+    "interpretation": "EVERY ONE OF THESE GAPS IS IMPLEMENTATION, NOT PHYSICS. That is the good news: none of it is a law, all of it is code we control.",
+    "known_causes_and_status": {
+      "fused_MoE_gather_capped_at_8_tokens": "FIXED PR #56 - boundary now derived (~683 at top-6). Makes the path FLAT per token, NOT amortizing (no dedup). Expect 'stops collapsing', not 'starts scaling'.",
+      "scheduler_ran_half_the_batch": "FIXED PR #54 - coalescing selector; measured 32 running/32 waiting at B=64 before.",
+      "no_dedup_across_tokens": "OPEN - one GEMV per (token,expert) pair. The grouped GEMM exists (qtip_grouped_gemm.cu, 5/5 HW parity) but only on the qtip2b rung. Crossover ~B=52 due to a measured 1.76x per-byte deficit.",
+      "GEMV_at_15pct_of_peak": "OPEN AND UNACCEPTABLE - EXL3 reaches ~80% for this format. Computed codebook (MERGED PR #46) measured 3.86-4.03x on fused decode GEMV at k_in=7168 => ~60% of peak. Needs a bake on the computed codebook to take effect at serve time.",
+      "per_step_host_overhead": "OPEN - the dominant b=1 term. CUDA-graph capture + fused decode. This is the 'megakernel' work Jish deprioritised; it is what stands between 15 tok/s and 640 at b=1.",
+      "xs_history_cache": "OPEN - 335,954 B/token vs KV's 88,064 (79% of per-token memory). Recomputed from a raw [B,T,hidden] buffer every step while the compressor only consumes a stride-ratio reduction. A rolling compressed state is 4-128x and gates whether B=128-256 is reachable at all."
+    }
+  },
+  "QUALITY_MODEL": {
+    "target": "GSM8K >= 90 on OUR protocol: n=100, 0-shot chat, 2048-token cap, seed 161",
+    "current_status": "NO CURRENT NUMBER EXISTS. 87.0% is PROVISIONAL and from superseded math.",
+    "why_87_is_void": "PR #35 (830a41ed9) changed decode math after it was measured: a SwiGLU clamp was missing on 4 of 5 expert paths INCLUDING the shared expert, which every token traverses in every layer (fixture magnitude when it bites: 0.7311 clamped vs 14.8996 unclamped = 20.4x); and YaRN was wrongly applied to ratio-0 layers (correct set exactly {0,1,43}). The new number may land either side of 87.0 and LOWER IS NOT A REGRESSION - it is the first number measured on math that matches the reference.",
+    "reference_comparison": "Published V4-Flash-Base scores 90.8 with 8-SHOT. That is a DIFFERENT AND EASIER protocol than our 0-shot. Always state this when comparing; we are not 3.8 points behind, we are measuring a harder task.",
+    "ladder_so_far": [
+      {
+        "session": "s1",
+        "score": 64.0,
+        "note": "640-token cap, 33 truncated - cap-limited, not quality-limited"
+      },
+      {
+        "session": "s2",
+        "score": 84.0
+      },
+      {
+        "session": "s3",
+        "score": 87.0,
+        "note": "on GPU-Viterbi bake; NOW PROVISIONAL"
+      }
+    ],
+    "levers_to_90_plus_ranked": [
+      {
+        "lever": "Re-measure on corrected math (the SwiGLU clamp fix)",
+        "expected_direction": "neutral-to-better",
+        "cost": "~40 min, ~$3",
+        "status": "NOT RUN - this is step 1 and it may already clear the bar"
+      },
+      {
+        "lever": "Arc Boost: confidence-weighted voting k=5",
+        "expected_direction": "up",
+        "cost": "one session",
+        "status": "unfired; was blocked on the xs_history multi-chain crash, fixed in PR #21"
+      },
+      {
+        "lever": "Exhaustive search instead of beam",
+        "expected_direction": "up (+0.0013..+0.0021 cos, wins 8/9 fixture cells)",
+        "status": "the qtip2b rung uses exhaustive by default"
+      },
+      {
+        "lever": "LDLQ/GPTQ-style block error feedback stacked on rotation",
+        "expected_direction": "up",
+        "status": "rotation only flattens the DIAGONAL; off-diagonal correlations survive and remain recoverable. Opt-in calibration pass for tenants with data."
+      },
+      {
+        "lever": "Higher beam width",
+        "expected_direction": "up but tiny",
+        "note": "W=256 vs W=32 costs ~1% of bake time (82.7 vs 83.6 s/layer on H200) - ALWAYS BAKE W=256, quality is free here"
+      }
+    ],
+    "quality_is_not_the_bottleneck": "87.0 (provisional) against a 90.8 8-shot reference on a harder protocol, with 4 unfired levers and a bake-time quality upgrade that costs 1%. The hard problem is throughput, not quality."
+  },
+  "ECONOMICS": {
+    "measured_today": {
+      "B": 64,
+      "aggregate_tok_s": 8.14,
+      "usd_per_Mtok": 165.51,
+      "box": "H200 @ $4.85/hr"
+    },
+    "at_physics_ceiling": {
+      "B": 256,
+      "aggregate_tok_s": 16602,
+      "usd_per_Mtok": 0.081,
+      "note": "4.85 / (16602 * 3600 / 1e6)"
+    },
+    "interpretation": "The distance between $165/Mtok and $0.08/Mtok is entirely engineering. Every step toward it is compute that does not need to be bought and power that does not need to be burned."
+  }
+}

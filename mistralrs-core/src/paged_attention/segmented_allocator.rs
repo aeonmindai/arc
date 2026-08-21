@@ -12,10 +12,11 @@
 //! [`Self::rollback`] name a `(request_id, segment_index)` pair. No operation
 //! reads another request's table, so no request's progress can be pinned by
 //! another's. That is the allocator-level precondition for lifting the MTP
-//! batch ceiling recorded in `memory/mission/wave59-CJ-mtp-batch.md` §3, where
-//! one dense shared cache forces `next_u = u + a + 1 - min_i(u_i + a_i)` and a
-//! single sequence rejecting its first draft ratchets every other sequence's
-//! uncached tail to the window. **It is a precondition, not the fix** — the
+//! batch ceiling recorded in `memory/mission/wave45-BW-mtp-batched.md` §2,
+//! where one dense shared cache rolls back to `C + min_i(u_i + accepted_i)` —
+//! the one length every sequence can prove — so a single sequence rejecting its
+//! first draft ratchets every other sequence's uncached tail to the window.
+//! **It is a precondition, not the fix** — the
 //! fused MTP step still has to stop rolling one shared cache. See
 //! `pipeline/mtp_pipeline.rs`.
 //!

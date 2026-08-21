@@ -8,7 +8,7 @@
 //! nothing goes red — the compiler has no opinion about prose.
 //!
 //! Prose cannot be checked mechanically. But the load-bearing part of Arc's
-//! docs is not prose, it is **evidence**: `path/to/file.rs:123` citations that
+//! docs is not prose, it is **evidence**: file-and-line citations that
 //! a reader is expected to follow. Those *are* mechanically checkable, and when
 //! they rot the surrounding claim is unfalsifiable — the reader lands on
 //! unrelated code and cannot tell whether the doc was ever right.
@@ -28,6 +28,29 @@
 //!    backticked identifier — `` `build_expert_parallel_plan`
 //!    (`deepseek4.rs:2211`) ``, by far the dominant shape in these docs — the
 //!    identifier must appear near the cited line.
+//!
+//! ## Where it looks: `.md` **and Rust comments**
+//!
+//! For its first life this gate read `.md` files only. That was a hole big
+//! enough to drive the whole point through: Arc's densest citation corpus is
+//! not the mission record, it is the **module and item docs in the crates
+//! themselves** — several hundred `file.rs:N` pointers written by the same
+//! agents, into the same moving code, and *none* of them were gated. A doc
+//! comment that says "the mask is dropped at `sinks.rs:214`" rots exactly like
+//! a `.md` one, and rots faster, because the file it cites is the file it
+//! lives next to.
+//!
+//! So [`SCAN_ROOTS`] now names the first-party crate directories too, and
+//! [`analyze`] reads `.rs` alongside `.md`.
+//!
+//! **In a `.rs` file only comment text is scanned** — see [`rust_comment`].
+//! Code is not prose: a `.rs` line may hold a path-and-number inside a string
+//! literal (this very file's [`BASELINE`] is a table of them, and its fixtures
+//! build citations that are *deliberately* wrong). Scanning those would
+//! manufacture [`Kind::SymbolRot`] findings, which have no waiver path, and
+//! the gate would be unlandable against its own source. The extractor is
+//! deliberately conservative: when it cannot tell whether a `//` is a comment
+//! or string content, it treats the line as code and skips it.
 //!
 //! ## Drift versus rot
 //!
@@ -86,7 +109,8 @@ use std::path::{Path, PathBuf};
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Directories scanned for `.md` files carrying citations.
+/// Directories scanned for files carrying citations — `.md` anywhere, and
+/// `.rs` **comments** in the first-party crates.
 ///
 /// `docs/` and `research/` are deliberately **excluded for now**: 212 of their
 /// 336 citations point into external reference checkouts (the v4 reference
@@ -94,7 +118,32 @@ use std::path::{Path, PathBuf};
 /// waiver rows and almost no verification. `memory/` is the mission record and
 /// `arc-tools/` the runbooks — that is where a false citation does damage.
 /// Adding a root here is a one-line change plus whatever waivers it brings.
-const SCAN_ROOTS: &[&str] = &["memory", "arc-tools"];
+///
+/// The crate roots below carry the ~310 citations that live in Rust comments.
+/// They are listed individually rather than as a bare `"."` for two reasons:
+/// `.` would sweep in `docs/` and `research/` by the back door, and it would
+/// index the vendored/generated trees that [`SKIP_DIRS`] only partly covers.
+/// Crates with no citations *today* are still named, so the first one written
+/// tomorrow is gated on arrival rather than on someone remembering this list.
+const SCAN_ROOTS: &[&str] = &[
+    "memory",
+    "arc-tools",
+    "mistralrs-core",
+    "mistralrs-quant",
+    "arc-engine",
+    "arc-cli",
+    "arc-cuda-graph",
+    "arc-bench",
+    "arc-profiler",
+    "arc-turbo",
+];
+
+/// Extensions read as citation-bearing documents by [`analyze`].
+///
+/// Distinct from [`CITED_EXTS`] (what a citation may *point at*) and from
+/// [`CODE_EXTS`] (where a symbol may *live*). A `.rs` entry here means "read
+/// this file's comments", never its code — see [`rust_comment`].
+const SCANNED_DOC_EXTS: &[&str] = &["md", "rs"];
 
 /// Extensions a citation may point at. Anything else is not a citation.
 const CITED_EXTS: &[&str] = &[
@@ -135,8 +184,15 @@ const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "__pycac
 const DRIFT_WINDOW: i64 = 15;
 
 /// Floor on citations found, so an empty or mis-rooted scan fails loudly
-/// instead of reading as a pass. Measured at 798 when this landed.
-const CITATION_FLOOR: usize = 700;
+/// instead of reading as a pass.
+///
+/// Measured at 798 when this landed, 1,244 once `.rs` comments were added —
+/// the crates carry roughly a quarter of Arc's citation corpus. The floor is
+/// set above the `.md`-only total on purpose: reverting [`SCANNED_DOC_EXTS`]
+/// to `["md"]`, or dropping the crate [`SCAN_ROOTS`], drops the census back to
+/// ~970 and this fails. A scope guard has to notice scope *shrinking*, which
+/// is the exact way the Rust corpus went ungated for as long as it did.
+const CITATION_FLOOR: usize = 1_100;
 
 // ---------------------------------------------------------------------------
 // Findings
@@ -214,9 +270,11 @@ impl Finding {
 /// `cite` matching is deliberately two-mode, so the waiver is no broader than
 /// the debt it records:
 ///
-/// * contains `:` — matches that **exact citation** (`device.rs:754-908`).
+/// * contains `:` — matches that **exact citation**, line numbers and all.
 ///   Used where the line number is the thing that is wrong, so a second bad
-///   citation into the same file is not silently covered.
+///   citation into the same file is not silently covered. (No example is
+///   spelled out here: since this gate reads `.rs` comments, a citation
+///   written in prose *about* the matcher would be scanned as a real one.)
 /// * no `:` — matches **any citation of that path** in that doc. Used for
 ///   external references, where every line of `server_args.py` is equally
 ///   unresolvable and pinning each would be noise.
@@ -808,6 +866,609 @@ static BASELINE: &[Waiver] = &[
         kind: Kind::Unresolved,
         why: "candle upstream, a registry dependency, not vendored here",
     },
+    // -- Rust-comment citations, added when SCAN_ROOTS grew to cover the
+    //    crates (see the module docs). Every row below is a pointer into an
+    //    upstream reference checkout — sglang, vLLM, TensorRT-LLM, DeepSeek's
+    //    own `inference/`, the QTIP reference, candle, cudarc, toktrie — that
+    //    Arc reads beside the code but does not vendor, so none of them can
+    //    ever resolve here. **No `SymbolRot` accompanied this widening**: the
+    //    ~310 citations in Rust comments all name symbols that still exist.
+    Waiver {
+        doc: "arc-engine/src/weight_schema.rs",
+        cite: "deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/attention/backends/flash.rs",
+        cite: "candle-flash-attn-v3/src/lib.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/attention/backends/flash.rs",
+        cite: "hkernel/flash_fwd_launch_template.h",
+        kind: Kind::Unresolved,
+        why: "flash-attention is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/kv_cache/single_cache.rs",
+        cite: "candle-core/src/tensor_cat.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/kv_sharing/evict.rs",
+        cite: "evict_policy.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/kv_sharing/evict.rs",
+        cite: "python/sglang/srt/mem_cache/evict_policy.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/kv_sharing/radix.rs",
+        cite: "radix_cache.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/layers.rs",
+        cite: "candle-core/src/tensor_cat.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/layers.rs",
+        cite: "deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/layers.rs",
+        cite: "inference/model.py",
+        kind: Kind::Unresolved,
+        why: "DeepSeek's own inference/ reference is an upstream reference \
+              checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/layers.rs",
+        cite: "srt/models/deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "candle-core/src/tensor_cat.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "deepseek_v4_memory_pool.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "deepseek_v4_nextn.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "deepseek_v4_rope.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "eagle_utils.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "eagle_worker.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "inference/model.py",
+        kind: Kind::Unresolved,
+        why: "DeepSeek's own inference/ reference is an upstream reference \
+              checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "mem_cache/deepseek_v4_memory_pool.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "model.py",
+        kind: Kind::Unresolved,
+        why: "DeepSeek's own inference/ reference is an upstream reference \
+              checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "router/gate_linear.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "srt/layers/deepseek_v4_rope.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "srt/models/deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "srt/models/deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/deepseek4.rs",
+        cite: "topk.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_attention.rs",
+        cite: "model_executor/pool_configurator.py",
+        kind: Kind::Unresolved,
+        why: "TensorRT-LLM is an upstream reference checkout, not vendored \
+              here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_indexer.rs",
+        cite: ".../sglang/srt/models/deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_indexer.rs",
+        cite: "attention/dsv4/compressor.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_indexer.rs",
+        cite: "compressor.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_indexer.rs",
+        cite: "deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_indexer.rs",
+        cite: "indexer.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_kv_fp8.rs",
+        cite: "inference/model.py",
+        kind: Kind::Unresolved,
+        why: "DeepSeek's own inference/ reference is an upstream reference \
+              checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_mhc.rs",
+        cite: "deepseek_v4_nextn.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_mhc.rs",
+        cite: "sglang/srt/layers/mhc.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/models/dsv4_mhc.rs",
+        cite: "sglang/srt/models/deepseek_v4_nextn.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/expert_parallel.rs",
+        cite: "sglang/python/sglang/srt/eplb/eplb_algorithms/deepseek.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/expert_parallel.rs",
+        cite: "tensorrt_llm/examples/wide_ep/ep_load_balancer/README.md",
+        kind: Kind::Unresolved,
+        why: "TensorRT-LLM is an upstream reference checkout, not vendored \
+              here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/experts.rs",
+        cite: "inference/model.py",
+        kind: Kind::Unresolved,
+        why: "DeepSeek's own inference/ reference is an upstream reference \
+              checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/experts.rs",
+        cite: "sglang/jit_kernel/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/experts.rs",
+        cite: "silu_and_mul_masked_post_quant.cuh",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/experts.rs",
+        cite: "sm100_fp8_fp4_mega_moe.cuh",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/moe/experts.rs",
+        cite: "srt/models/deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/llg.rs",
+        cite: "toktrie-1.7.0/src/toktree.rs",
+        kind: Kind::Unresolved,
+        why: "toktrie is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/llg.rs",
+        cite: "toktrie_hf_tokenizers-1.7.0/src/lib.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/loaders/normal_loaders.rs",
+        cite: "deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mod.rs",
+        cite: "cuda_backend/mod.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mod.rs",
+        cite: "tensor.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "config/speculative.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "deepseek_v4_nextn.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "eagle_info.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "eagle_utils.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "eagle_worker.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "eagle_worker_common.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "logits_processor.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "pyexecutor/resource_manager.py",
+        kind: Kind::Unresolved,
+        why: "TensorRT-LLM is an upstream reference checkout, not vendored \
+              here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "scheduler_components/batch_result_processor.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "server_args.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "spec_utils.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "speculative/eagle_worker_common.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "v1/core/sched/scheduler.py",
+        kind: Kind::Unresolved,
+        why: "vLLM is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/mtp_pipeline.rs",
+        cite: "v1/spec_decode/metrics.py",
+        kind: Kind::Unresolved,
+        why: "vLLM is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/pipeline/normal.rs",
+        cite: "candle-core/src/cuda_backend/device.rs",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/prefix_cacher.rs",
+        cite: "block_pool.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/prefix_cacher.rs",
+        cite: "radix_cache.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/src/sampler.rs",
+        cite: "candle-kernels/src/reduce.cu",
+        kind: Kind::Unresolved,
+        why: "candle is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/tests/synthetic_load_smoke.rs",
+        cite: "deepseek_v4_nextn.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-core/tests/synthetic_load_smoke.rs",
+        cite: "eagle_worker.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/cuda_peer.rs",
+        cite: "src/driver/result.rs",
+        kind: Kind::Unresolved,
+        why: "cudarc is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/cuda_peer.rs",
+        cite: "src/driver/safe/core.rs",
+        kind: Kind::Unresolved,
+        why: "cudarc is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/cuda_peer.rs",
+        cite: "src/driver/sys/mod.rs",
+        kind: Kind::Unresolved,
+        why: "cudarc is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "lib/algo/ldlq.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "lib/codebook/bitshift.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "lib/utils/math_utils.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "math_utils.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "quantize_llama/input_hessian_llama.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "research/code/01_weight_compression/qtip/lib/utils/data_utils.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    Waiver {
+        doc: "mistralrs-quant/src/qtip/viterbi.rs",
+        cite: "research/code/01_weight_compression/qtip/lib/utils/math_utils.py",
+        kind: Kind::Unresolved,
+        why: "the QTIP reference is an upstream reference checkout, not \
+              vendored here",
+    },
+    // -- Citations carried in by the six mission docs that were cited from
+    //    Rust comments but had never been committed (they existed on one
+    //    laptop). Same class as everything above: pointers into sglang, CUDA
+    //    headers and DeepSeek's configs, which Arc reads and does not vendor.
+    Waiver {
+        doc: "memory/mission/BUDGET_V4_B1.md",
+        cite: "cuda.h",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/BUDGET_V4_B1.md",
+        cite: "cuda_device_runtime_api.h",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/EXTERNAL_FINDINGS.md",
+        cite: "indexer.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave13-AH-config.md",
+        cite: "configs/deepseek_v4.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave13-AH-config.md",
+        cite: "deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave13-AH-config.md",
+        cite: "deepseek_v4_rope.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "allocator.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "deepseek_v2.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "docs/advanced_features/adaptive_speculative_decoding.md",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "eagle_info.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "eagle_utils.cu",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "eagle_worker.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "llama_eagle3.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "server_args.py",
+        kind: Kind::Unresolved,
+        why: "sglang is an upstream reference checkout, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "test/manual/dsv4/test_dsv4_pro_mtp.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "test_deepseek_v3_mtp.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
+    Waiver {
+        doc: "memory/mission/wave45-BW-mtp-batched.md",
+        cite: "test_dsv4_pro_mtp.py",
+        kind: Kind::Unresolved,
+        why: "cited from an upstream reference tree, not vendored here",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -822,6 +1483,7 @@ struct Repo {
     files: Vec<String>,
     by_suffix: BTreeMap<String, Vec<usize>>,
     bodies: HashMap<usize, Option<Vec<String>>>,
+    code_bodies: HashMap<usize, Option<Vec<String>>>,
 }
 
 impl Repo {
@@ -844,6 +1506,7 @@ impl Repo {
             files,
             by_suffix,
             bodies: HashMap::new(),
+            code_bodies: HashMap::new(),
         }
     }
 
@@ -890,10 +1553,37 @@ impl Repo {
         }
     }
 
-    /// Does `sym` appear as a whole word in any code file?
+    /// The file's lines with Rust comments blanked out, so a symbol that
+    /// survives only in prose does not read as a symbol that still exists.
+    ///
+    /// Non-`.rs` files are returned unchanged: `.md` never reaches here (it is
+    /// absent from [`CODE_EXTS`]) and the rest — `.py`, `.cu`, `.toml` — have
+    /// their own comment syntaxes that this gate has no reason to model.
+    fn code_lines(&mut self, idx: usize) -> Option<&Vec<String>> {
+        if !self.code_bodies.contains_key(&idx) {
+            let path = self.files[idx].clone();
+            let stripped = self.lines(idx).map(|body| {
+                if path.ends_with(".rs") {
+                    split_rust(&body.join("\n")).code
+                } else {
+                    body.clone()
+                }
+            });
+            self.code_bodies.insert(idx, stripped);
+        }
+        self.code_bodies.get(&idx).and_then(|o| o.as_ref())
+    }
+
+    /// Does `sym` appear as a whole word in the **code** of any code file?
     ///
     /// Only reached when a cited symbol is missing from its own cited file, so
     /// the whole-repo read stays rare.
+    ///
+    /// Comments are excluded — see [`RustSplit`]. Without that, a citation
+    /// written in a Rust doc comment is its own witness: the symbol it names
+    /// is present in the comment naming it, every [`Kind::SymbolRot`] softens
+    /// to a waivable [`Kind::SymbolMoved`], and the one verdict with no waiver
+    /// path stops being reachable for the entire crate corpus.
     fn symbol_exists_anywhere(&mut self, sym: &str) -> bool {
         let code: Vec<usize> = (0..self.files.len())
             .filter(|&i| has_ext(&self.files[i], CODE_EXTS))
@@ -904,7 +1594,11 @@ impl Repo {
             })
             .collect();
         for i in code {
-            if !self.symbol_lines(i, sym).is_empty() {
+            let hit = self
+                .code_lines(i)
+                .map(|body| body.iter().any(|l| contains_word(l, sym)))
+                .unwrap_or(false);
+            if hit {
                 return true;
             }
         }
@@ -1049,6 +1743,223 @@ fn identifier_before(chars: &[char], cite_start: usize) -> Option<String> {
     Some(last)
 }
 
+/// A Rust file cut into the two halves this gate treats differently.
+///
+/// Both halves matter and they matter in *opposite* directions, which is why
+/// one pass produces both:
+///
+/// * [`RustSplit::comments`] is where citations are allowed to live. Scanning
+///   code instead would manufacture [`Kind::SymbolRot`] out of string
+///   literals — this file's own [`BASELINE`] is a table of citation-shaped
+///   strings, and rot has no waiver path, so the gate would be unlandable
+///   against its own source.
+/// * [`RustSplit::code`] is where a symbol is allowed to *exist*. Once `.rs`
+///   files became documents, `symbol_exists_anywhere` started finding symbols
+///   in the very comment that cited them — every rot downgraded to the
+///   waivable [`Kind::SymbolMoved`] and the one unwaivable verdict quietly
+///   stopped being reachable for the whole new corpus. Blanking comments
+///   restores it, and it is the same rule `.md` already gets from
+///   [`CODE_EXTS`]: a symbol surviving only in prose is exactly the rot this
+///   is looking for.
+struct RustSplit {
+    /// `(1-based line, comment text)`, one entry per comment span.
+    comments: Vec<(usize, String)>,
+    /// The body line for line, with every comment span blanked to spaces.
+    code: Vec<String>,
+}
+
+/// Split Rust source into comment spans and comment-free code.
+///
+/// A line-at-a-time scanner cannot do this: a multi-line raw string
+/// (`r#"…"#`), a `\`-continued string literal and a `/* */` block all carry
+/// state across newlines, and a `//!` sitting inside any of them is not a
+/// comment. Getting that wrong is not cosmetic — the first fixture written for
+/// this feature was a multi-line raw string full of deliberately-broken
+/// citations, and a per-line scanner reported every one of them as real.
+///
+/// Handled: `//` line comments (so `///` and `//!` too), nested `/* */`
+/// blocks, `"…"` with `\` escapes, `r"…"` / `r#…#"…"#…` raw strings including
+/// the `b`-prefixed forms, and `'x'` char literals kept distinct from `'a`
+/// lifetimes.
+fn split_rust(body: &str) -> RustSplit {
+    #[derive(Clone, Copy)]
+    enum St {
+        Code,
+        Line,
+        Block(usize),
+        Str,
+        Raw(usize),
+    }
+
+    let chars: Vec<char> = body.chars().collect();
+    let mut st = St::Code;
+    let mut comments: Vec<(usize, String)> = Vec::new();
+    let mut code: Vec<String> = Vec::new();
+    let mut line_no = 1usize;
+    let mut cur_code = String::new();
+    let mut cur_comment = String::new();
+    let mut i = 0usize;
+
+    let flush_comment = |buf: &mut String, line: usize, out: &mut Vec<(usize, String)>| {
+        if !buf.trim().is_empty() {
+            out.push((line, std::mem::take(buf)));
+        } else {
+            buf.clear();
+        }
+    };
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\n' {
+            if matches!(st, St::Line) {
+                st = St::Code;
+            }
+            flush_comment(&mut cur_comment, line_no, &mut comments);
+            code.push(std::mem::take(&mut cur_code));
+            line_no += 1;
+            i += 1;
+            continue;
+        }
+        match st {
+            St::Line => {
+                cur_comment.push(c);
+                cur_code.push(' ');
+                i += 1;
+            }
+            St::Block(depth) => {
+                if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    st = if depth == 1 {
+                        St::Code
+                    } else {
+                        St::Block(depth - 1)
+                    };
+                    cur_comment.push_str("*/");
+                    cur_code.push_str("  ");
+                    i += 2;
+                } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    st = St::Block(depth + 1);
+                    cur_comment.push_str("/*");
+                    cur_code.push_str("  ");
+                    i += 2;
+                } else {
+                    cur_comment.push(c);
+                    cur_code.push(' ');
+                    i += 1;
+                }
+            }
+            St::Str => {
+                cur_code.push(c);
+                if c == '\\' {
+                    if let Some(&n) = chars.get(i + 1) {
+                        // A `\` at end of line continues the literal; the
+                        // newline arm above must still see the `\n`.
+                        if n != '\n' {
+                            cur_code.push(n);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                if c == '"' {
+                    st = St::Code;
+                }
+                i += 1;
+            }
+            St::Raw(hashes) => {
+                cur_code.push(c);
+                if c == '"' {
+                    let closed = (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
+                    if closed {
+                        for _ in 0..hashes {
+                            cur_code.push('#');
+                        }
+                        st = St::Code;
+                        i += 1 + hashes;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            St::Code => {
+                if c == '/' && chars.get(i + 1) == Some(&'/') {
+                    st = St::Line;
+                    cur_comment.push_str("//");
+                    cur_code.push_str("  ");
+                    i += 2;
+                } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    st = St::Block(1);
+                    cur_comment.push_str("/*");
+                    cur_code.push_str("  ");
+                    i += 2;
+                } else if c == '"' {
+                    st = St::Str;
+                    cur_code.push(c);
+                    i += 1;
+                } else if c == 'r' && raw_open(&chars, i).is_some() {
+                    let (hashes, span) = raw_open(&chars, i).expect("checked");
+                    st = St::Raw(hashes);
+                    cur_code.extend(chars[i..i + span].iter());
+                    i += span;
+                } else if c == '\'' {
+                    // `'x'` / `'\n'` are literals; `'a` in `&'a str` is not.
+                    let escaped =
+                        chars.get(i + 1) == Some(&'\\') && chars.get(i + 3) == Some(&'\'');
+                    let plain = chars.get(i + 1) != Some(&'\\') && chars.get(i + 2) == Some(&'\'');
+                    let span = if escaped {
+                        4
+                    } else if plain {
+                        3
+                    } else {
+                        1
+                    };
+                    cur_code.extend(chars[i..(i + span).min(chars.len())].iter());
+                    i += span;
+                } else {
+                    cur_code.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    flush_comment(&mut cur_comment, line_no, &mut comments);
+    if !cur_code.is_empty() {
+        code.push(cur_code);
+    }
+    RustSplit { comments, code }
+}
+
+/// If a raw-string literal opens at `i` (the `r`), its hash count and the
+/// width of the opening token. `br"…"` reaches here with `i` on the `r`.
+fn raw_open(chars: &[char], i: usize) -> Option<(usize, usize)> {
+    let mut k = i + 1;
+    let mut hashes = 0usize;
+    while chars.get(k) == Some(&'#') {
+        hashes += 1;
+        k += 1;
+    }
+    if chars.get(k) == Some(&'"') {
+        Some((hashes, k + 1 - i))
+    } else {
+        None
+    }
+}
+
+/// Every `(line, text)` in a document that a citation may live in.
+///
+/// `.md` is prose end to end. `.rs` is prose only inside comments.
+fn prose_spans(doc: &str, body: &str) -> Vec<(usize, String)> {
+    if doc.ends_with(".rs") {
+        split_rust(body).comments
+    } else {
+        body.lines()
+            .enumerate()
+            .map(|(n, l)| (n + 1, l.to_string()))
+            .collect()
+    }
+}
+
 /// Extract every citation on one line of a doc.
 fn citations_in_line(line: &str) -> Vec<Citation> {
     let chars: Vec<char> = line.chars().collect();
@@ -1123,7 +2034,7 @@ fn analyze(root: &Path, scan_roots: &[&str]) -> Census {
         let base = root.join(scan);
         let mut found = Vec::new();
         walk(root, &base, &mut found);
-        docs.extend(found.into_iter().filter(|p| p.ends_with(".md")));
+        docs.extend(found.into_iter().filter(|p| has_ext(p, SCANNED_DOC_EXTS)));
     }
     docs.sort();
     // So a nested scan root ("memory" plus "memory/mission") counts each doc
@@ -1142,9 +2053,8 @@ fn analyze(root: &Path, scan_roots: &[&str]) -> Census {
             Ok(b) => b,
             Err(_) => continue,
         };
-        for (n, line) in body.lines().enumerate() {
-            let doc_line = n + 1;
-            for c in citations_in_line(line) {
+        for (doc_line, prose) in prose_spans(doc, &body) {
+            for c in citations_in_line(&prose) {
                 census.total += 1;
                 let mk = |kind: Kind, detail: String| Finding {
                     doc: doc.clone(),
@@ -1439,6 +2349,9 @@ impl Scratch {
     fn run(&self) -> Census {
         analyze(&self.0, &["memory"])
     }
+    fn run_roots(&self, roots: &[&str]) -> Census {
+        analyze(&self.0, roots)
+    }
 }
 
 impl Drop for Scratch {
@@ -1535,6 +2448,88 @@ fn fixtures_prove_each_violation_class_fails() {
 
     // Rot is not waivable — no BASELINE row could ever silence it.
     assert!(!Kind::SymbolRot.is_waivable());
+}
+
+/// **Proof that reading `.rs` is not decorative, and that it reads only
+/// comments.**
+///
+/// Two failures are possible when a citation gate grows a second file type,
+/// and both are silent: it can scan `.rs` and find nothing (the corpus stays
+/// ungated while the census looks bigger), or it can scan `.rs` code and
+/// manufacture unwaivable [`Kind::SymbolRot`] out of string literals. The
+/// fixture below contains one of each shape, plus the three lines that
+/// [`rust_comment`] has to get right — an escaped quote, a raw string holding
+/// `//`, and a lifetime — and asserts exactly which citations come back.
+#[test]
+fn rust_comments_are_scanned_and_code_is_not() {
+    let s = Scratch::new("rustcomments");
+    s.write("src/foo.rs", &fixture_source());
+    s.write(
+        "src/claims.rs",
+        r####"
+//! Module doc: `alpha_beta` (`src/foo.rs:10`) is the entry point.
+/// Item doc citing a range: `alpha_beta` (`src/foo.rs:5-15`).
+const CITE: &str = "`ghost_symbol` (src/foo.rs:10)"; // a literal, not a claim
+let msg = "he said \"see src/foo.rs:10\""; // escaped quotes stay in the string
+let url = r#"https://x/y//src/foo.rs:10"#; // a raw string holding a comment marker
+fn f<'a>(x: &'a str) {} // lifetime, then a real one: `alpha_beta` (`src/foo.rs:10`)
+"####,
+    );
+    let c = s.run_roots(&["src"]);
+
+    // Every citation the extractor found, in order.
+    let body = fs::read_to_string(s.0.join("src/claims.rs")).expect("fixture readable");
+    let found: Vec<String> = prose_spans("src/claims.rs", &body)
+        .into_iter()
+        .flat_map(|(_, p)| citations_in_line(&p).into_iter().map(|c| c.text))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            "src/foo.rs:10",   // module doc
+            "src/foo.rs:5-15", // item doc
+            "src/foo.rs:10",   // trailing comment on the lifetime line
+        ],
+        "comment text must be scanned and code text must not"
+    );
+
+    // And end to end: nothing in that file is a violation. If string literals
+    // leaked in, `ghost_symbol` would be an unwaivable SymbolRot.
+    assert!(
+        c.findings.is_empty(),
+        "a .rs fixture whose comments all check out must be clean:\n{}",
+        c.findings
+            .iter()
+            .map(|f| f.render())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(c.total, 3, "3 citations live in comments in that fixture");
+}
+
+/// A `.rs` file whose **comment** carries a rotten citation is caught, so the
+/// widening is a gate and not just a bigger census.
+#[test]
+fn rust_comment_citations_are_gated() {
+    let s = Scratch::new("rustgate");
+    s.write("src/foo.rs", &fixture_source());
+    s.write(
+        "src/claims.rs",
+        "//! `gamma_delta_gone` (`src/foo.rs:10`) does the work.\n\
+         //! Also `alpha_beta` (`src/foo.rs:999`).\n",
+    );
+    let c = s.run_roots(&["src"]);
+    let kinds: BTreeSet<Kind> = c.findings.iter().map(|f| f.kind).collect();
+    assert!(
+        kinds.contains(&Kind::SymbolRot),
+        "a dead symbol cited from a Rust comment must be rot: {:?}",
+        c.findings.iter().map(|f| f.render()).collect::<Vec<_>>()
+    );
+    assert!(
+        kinds.contains(&Kind::OutOfRange),
+        "a past-the-end line cited from a Rust comment must be out of range: {:?}",
+        c.findings.iter().map(|f| f.render()).collect::<Vec<_>>()
+    );
 }
 
 /// The other half of "prove it red": the same checker must stay **green** on
