@@ -153,8 +153,14 @@
 //! probe peaked at 3.3, but that number belongs to that probe, not to
 //! DeepSeek-V4. If a real `max|x_rotated|` ever exceeds
 //! [`TCFRAG2B_MAX_FP16_ACTIVATION`] the mma sees an infinity. The remedy in
-//! this change is the kill switch (`ARC_QTIP_TCFRAG=0`), not a silent clamp:
-//! clamping would trade a visible infinity for an invisible wrong answer.
+//! this change is not to enable the path (`ARC_QTIP_TCFRAG` is opt-in and
+//! defaults OFF), not a silent clamp: clamping would trade a visible infinity
+//! for an invisible wrong answer.
+//!
+//! This unmeasured overflow risk is the second reason the gate is opt-in
+//! rather than a default-on kill switch. A remedy that only works if the
+//! operator already knows to reach for it is not a remedy for the operator
+//! who does not.
 
 use super::bitshift::{mcg_codeword, K2B, L2B};
 
@@ -250,6 +256,22 @@ impl Tcfrag2bLayout {
 // ---------------------------------------------------------------------------
 // The layout itself.
 // ---------------------------------------------------------------------------
+
+/// Does this `ARC_QTIP_TCFRAG` value select TCFRAG-2B?
+///
+/// **Only the exact string `"1"`.** Unset, `"0"`, `"off"`, `"true"`, and any
+/// typo all mean "keep the shipped `qtip2b_gemv_tuned_kernel`".
+///
+/// This lives here rather than beside its caller in `qtip::cuda_ops` for one
+/// reason: that module is `#![cfg(feature = "cuda")]`, so a polarity test
+/// written there cannot run on a machine without CUDA — which is every machine
+/// the gate's polarity has ever been reviewed on. The parse is pure, so it
+/// belongs where `cargo test` can actually reach it. See
+/// [`tests::tcfrag_gate_is_opt_in_and_only_literal_one_enables`].
+#[inline]
+pub fn tcfrag2b_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
 
 /// Words per row for a row of `num_symbols` symbols.
 ///
@@ -616,6 +638,33 @@ mod tests {
             packed[t >> 2] |= sym << ((t & 3) * 2);
         }
         (syms, packed)
+    }
+
+    /// TCFRAG-2B must be opt-in, and only the literal `"1"` may opt in.
+    ///
+    /// This kernel's own header says "UNVERIFIED ON HARDWARE — NEVER RUN" and
+    /// "the whole of the b=1 decode path". It shipped default-ON behind a kill
+    /// switch matching `0`/`off`/`false`/`no`, so a typo left the never-run
+    /// kernel serving single-user production and only an exactly-spelled value
+    /// could get back to the verified one. If this test ever goes red because
+    /// someone widened the match again, that is the regression — not the test.
+    #[test]
+    fn tcfrag_gate_is_opt_in_and_only_literal_one_enables() {
+        assert!(
+            !tcfrag2b_enabled_from(None),
+            "unset must NOT enable an unverified kernel on the b=1 decode path"
+        );
+        assert!(tcfrag2b_enabled_from(Some("1")));
+        // Every value the old kill switch treated as "revert", plus the typos
+        // it treated as "stay on the unverified path".
+        for v in [
+            "0", "off", "false", "no", "", "true", "on", "yes", "2", "ON", "1 ", " 1", "l", "one",
+        ] {
+            assert!(
+                !tcfrag2b_enabled_from(Some(v)),
+                "`ARC_QTIP_TCFRAG={v}` must not select the unverified kernel"
+            );
+        }
     }
 
     /// THE format property. If this fails the byte order is wrong and every

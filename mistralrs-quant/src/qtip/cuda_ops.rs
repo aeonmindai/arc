@@ -1575,19 +1575,45 @@ pub(crate) fn dequantize_2b_cuda(
 // and `kernels/qtip/qtip2b_tcfrag.cu` for the kernel.
 // ===========================================================================
 
-/// The kill switch. TCFRAG-2B is the **fast-path default**; `ARC_QTIP_TCFRAG=0`
-/// (or `off`/`false`/`no`) reverts every qtip2b GEMV to the shipped kernel in
-/// the same binary, so the first box can A/B without a rebuild.
+/// The opt-in switch. TCFRAG-2B is **default OFF**: `ARC_QTIP_TCFRAG=1`, and
+/// only that exact value, routes qtip2b GEMVs to the tensor-core kernel.
+/// Anything else — unset, `0`, `off`, a typo — keeps the shipped
+/// `qtip2b_gemv_tuned_kernel`, so the two still run from one binary and the
+/// A/B still needs no rebuild.
 ///
-/// Anything else — including an unparsable value — leaves the fast path on,
-/// deliberately: a typo in an env var must not silently change which kernel
-/// serves production. A user who means to revert can see it in the logs.
+/// # 🔴 THIS WAS A DEFAULT-ON KILL SWITCH, AND THE POLARITY WAS BACKWARDS
+///
+/// It shipped matching `0`/`off`/`false`/`no`, with everything else — "including
+/// an unparsable value" — leaving the fast path on, on the stated reasoning
+/// that *"a typo in an env var must not silently change which kernel serves
+/// production"*.
+///
+/// That reasoning is correct. It was applied in the wrong direction. The
+/// kernel it selects opens with:
+///
+/// ```text
+/// ⚠️  UNVERIFIED ON HARDWARE — NEVER RUN.
+///
+/// No part of this file has executed on a GPU. It has been compiled (nvcc
+/// sm_80 + sm_90, the repo's free no-GPU CI gate) and nothing more.
+/// ```
+///
+/// and by that same header it owns *"the whole of the b=1 decode path"* —
+/// which `tcfrag2b_layout_for` below confirms, since it is consulted on every
+/// qtip2b GEMV. So the shipped default was: a never-executed kernel serves
+/// single-user production, and only an exactly-spelled env value can get back
+/// to the kernel that has actually run. A typo landed on the unverified side.
+///
+/// Opt-in inverts exactly that. The verified kernel is what you get unless you
+/// deliberately ask for the other one, which is the polarity this crate
+/// applies everywhere else a `🔴 UNVERIFIED` kernel is gated (see
+/// `blockwise_fp8::gemv_wide`). Flip the default back only once TCFRAG-2B has
+/// produced coherent output on a GPU and that run is written down.
 pub(crate) fn tcfrag2b_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("ARC_QTIP_TCFRAG").as_deref() {
-        Ok("0") | Ok("off") | Ok("false") | Ok("no") => false,
-        _ => true,
+    *ON.get_or_init(|| {
+        super::tcfrag2b::tcfrag2b_enabled_from(std::env::var("ARC_QTIP_TCFRAG").ok().as_deref())
     })
 }
 
@@ -1778,9 +1804,9 @@ pub(crate) fn fused_gemv_2b_cuda(
     let tune_variant = super::tune::gemv_variant_for_shape(n_rows, in_features)
         .filter(|&v| v != super::tune::QTIP2B_GEMV_VARIANT_LEGACY);
 
-    // TCFRAG-2B (fast-path default; `ARC_QTIP_TCFRAG=0` reverts). The guard
-    // must outlive the launch, so it is bound at function scope like every
-    // other pointer here.
+    // TCFRAG-2B (opt-in; `ARC_QTIP_TCFRAG=1` selects it, default is the
+    // shipped kernel). The guard must outlive the launch, so it is bound at
+    // function scope like every other pointer here.
     let tcfrag_layout = tcfrag.and(tcfrag2b_layout_for(&dev));
     let tcfrag_sl = tcfrag.map(|t| t.storage_and_layout());
     let tcfrag_bound = match (&tcfrag_sl, tcfrag_layout) {
@@ -1992,7 +2018,7 @@ pub(crate) fn gather_gemv_2b_cuda(
     let tune_variant = super::tune::gemv_variant_for_shape(n_rows, in_features)
         .filter(|&v| v != super::tune::QTIP2B_GEMV_VARIANT_LEGACY);
 
-    // TCFRAG-2B (fast-path default; `ARC_QTIP_TCFRAG=0` reverts).
+    // TCFRAG-2B (opt-in; `ARC_QTIP_TCFRAG=1` selects it).
     let tcfrag_layout = tcfrag.and(tcfrag2b_layout_for(&dev));
     let tcfrag_sl = tcfrag.map(|t| t.storage_and_layout());
     let tcfrag_bound = match (&tcfrag_sl, tcfrag_layout) {
