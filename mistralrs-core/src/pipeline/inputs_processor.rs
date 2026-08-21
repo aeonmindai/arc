@@ -580,6 +580,50 @@ pub mod text_models_inputs_processor {
         })
     }
 
+    /// Stack a rectangular cohort of token rows into `[B, L]` with **one**
+    /// host-to-device transfer.
+    ///
+    /// The decode path used to build one `Tensor::new(.., device)` per
+    /// sequence and `Tensor::cat` them. On a CUDA device that is B separate
+    /// **1-element** H2D transfers — each a pageable copy on the legacy
+    /// default stream, i.e. a full host/device round trip — plus a B-argument
+    /// `cat`, which candle services with one `copy2d` per argument. At B=256
+    /// that is 256 synchronous transfers and 256 copy kernels to assemble a
+    /// `[256, 1]` tensor holding one kilobyte. The call site carried the
+    /// standing note that this is "CLAUDE.md pitfall #5, still live".
+    ///
+    /// Every decode row is exactly one token, so the cohort is a rectangle and
+    /// one flat host buffer reshaped to `[B, L]` is the identical tensor.
+    ///
+    /// **Ragged input is refused, not reshaped.** A wrong-width row would
+    /// otherwise reinterpret one sequence's tokens as another's — silent,
+    /// per-token, and invisible in any shape assertion downstream, since the
+    /// element count could still divide evenly.
+    pub(crate) fn stack_uniform_rows<T: WithDType>(
+        rows: Vec<Vec<T>>,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let n_rows = rows.len();
+        if n_rows == 0 {
+            anyhow::bail!("stack_uniform_rows: empty batch — no sequences to stack");
+        }
+        let cols = rows[0].len();
+        if let Some(bad) = rows.iter().position(|r| r.len() != cols) {
+            anyhow::bail!(
+                "stack_uniform_rows: row {bad} has {} tokens but row 0 has {cols}. \
+                 This is the decode path, where every row is exactly one token — \
+                 a ragged cohort here means the caller changed and the flat \
+                 reshape would silently mix sequences.",
+                rows[bad].len()
+            );
+        }
+        let mut flat = Vec::with_capacity(n_rows * cols);
+        for row in rows {
+            flat.extend_from_slice(&row);
+        }
+        Ok(Tensor::from_vec(flat, (n_rows, cols), device)?)
+    }
+
     fn make_completion_chunk<T: WithDType>(
         toks: Vec<&[T]>,
         input_seqs: &[&mut Sequence],
@@ -589,7 +633,8 @@ pub mod text_models_inputs_processor {
     ) -> Result<InputMetadata> {
         // Pad each sequence by the padding token to the max len.
         let flash_attn = crate::using_flash_attn();
-        let mut seqs_tensors = Vec::new();
+        // Host-side rows, stacked once at the end — see [`stack_uniform_rows`].
+        let mut seq_rows: Vec<Vec<T>> = Vec::with_capacity(input_seqs.len());
         let mut seqlen_offsets = Vec::new();
         let mut context_lens = Vec::new();
         let mut position_ids = Vec::new();
@@ -613,13 +658,11 @@ pub mod text_models_inputs_processor {
                 seqlens_k.push((ctxt.len() + start_pos) as u32);
             }
 
-            // CLAUDE.md pitfall #5, still live: one `Tensor::new` on the GPU
-            // device per sequence per decode step, i.e. B separate 1-element
-            // H2D transfers, each of which is a host/device round trip.
-            {
-                let _s = arc_profiler::sync_span("input_prep.h2d_per_seq");
-                seqs_tensors.push(Tensor::new(ctxt, device).unwrap().unsqueeze(0).unwrap());
-            }
+            // Was CLAUDE.md pitfall #5: one `Tensor::new` on the GPU device
+            // per sequence per decode step — B separate 1-element H2D
+            // transfers, each a host/device round trip. The row stays on the
+            // host here and the whole cohort crosses in one transfer below.
+            seq_rows.push(ctxt);
 
             if let Some(paged_attn_metadata) = &mut paged_attn_metadata {
                 let kv_mgr = get_mut_arcmutex!(paged_attn_metadata.kv_cache_manager);
@@ -896,8 +939,8 @@ pub mod text_models_inputs_processor {
         };
 
         let input = {
-            let _s = arc_profiler::span("input_prep.cat");
-            Tensor::cat(&seqs_tensors, 0).unwrap()
+            let _s = arc_profiler::sync_span("input_prep.h2d_cohort");
+            stack_uniform_rows(seq_rows, device)?
         };
         Ok(InputMetadata {
             input,
@@ -1766,5 +1809,78 @@ mod cursor_reaches_every_path_tests {
              process now runs with a chunk size it never asked for, which is \
              exactly the contamination the `set_var` version caused"
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_cohort_crosses_once_tests {
+    use super::text_models_inputs_processor::stack_uniform_rows;
+    use candle_core::Device;
+
+    /// **One transfer, and the same tensor as B transfers produced.**
+    ///
+    /// The decode path used to build one `Tensor::new` per sequence on the GPU
+    /// device and `cat` them: at B=256 that is 256 pageable 1-element H2D
+    /// transfers on the legacy default stream — 256 host/device round trips —
+    /// plus 256 `copy2d` launches, to assemble a `[256, 1]` tensor holding a
+    /// kilobyte. This pins that the single-transfer form is byte-identical to
+    /// the per-row form it replaces, on the `[B, 1]` decode shape and on a
+    /// wider rectangle.
+    #[test]
+    fn stacking_once_equals_stacking_row_by_row() -> candle_core::Result<()> {
+        let dev = Device::Cpu;
+        for cols in [1usize, 3] {
+            let rows: Vec<Vec<u32>> = (0..7u32)
+                .map(|r| (0..cols as u32).map(|c| r * 100 + c).collect())
+                .collect();
+
+            // The shape this replaces: one tensor per row, then `cat`.
+            let per_row: Vec<candle_core::Tensor> = rows
+                .iter()
+                .map(|r| {
+                    candle_core::Tensor::new(r.clone(), &dev)
+                        .unwrap()
+                        .unsqueeze(0)
+                        .unwrap()
+                })
+                .collect();
+            let want = candle_core::Tensor::cat(&per_row, 0)?;
+
+            let got = stack_uniform_rows(rows, &dev).expect("uniform rows stack");
+            assert_eq!(got.dims(), want.dims(), "shape differs at cols={cols}");
+            assert_eq!(
+                got.flatten_all()?.to_vec1::<u32>()?,
+                want.flatten_all()?.to_vec1::<u32>()?,
+                "contents differ at cols={cols}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A ragged cohort must be **refused**, never reshaped.
+    ///
+    /// The dangerous case is the one that still divides evenly: rows of 1, 2
+    /// and 3 tokens hold 6 elements, which reshapes cleanly to `[3, 2]` and
+    /// hands sequence 0 a token belonging to sequence 1. Nothing downstream
+    /// could see it — the shape is right, only the contents are somebody
+    /// else's.
+    #[test]
+    fn a_ragged_cohort_is_refused_even_when_the_count_divides() {
+        let dev = Device::Cpu;
+        let rows: Vec<Vec<u32>> = vec![vec![1], vec![2, 3], vec![4, 5, 6]];
+        assert_eq!(rows.iter().map(|r| r.len()).sum::<usize>(), 6);
+        assert_eq!(6 % rows.len(), 0, "the fixture must divide evenly");
+        let err =
+            stack_uniform_rows(rows, &dev).expect_err("a ragged cohort must not silently reshape");
+        let msg = format!("{err}");
+        assert!(msg.contains("row 1"), "the error must name the row: {msg}");
+    }
+
+    /// An empty batch is a caller bug, not a `[0, 0]` tensor.
+    #[test]
+    fn an_empty_batch_is_an_error() {
+        let dev = Device::Cpu;
+        let rows: Vec<Vec<u32>> = Vec::new();
+        assert!(stack_uniform_rows(rows, &dev).is_err());
     }
 }
