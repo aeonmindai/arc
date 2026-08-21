@@ -14,6 +14,21 @@ pub type CUgraphConditionalHandle = u64;
 #[cfg(feature = "cuda")]
 pub type CUmemoryPool = *mut std::ffi::c_void;
 #[cfg(feature = "cuda")]
+pub type CUcontext = *mut std::ffi::c_void;
+/// `cuda.h:1944` (CUDA 13.1) —
+/// `#define CU_GRAPH_COND_ASSIGN_DEFAULT 0x1` "Default value is applied when
+/// graph is launched."
+///
+/// `cuda.h:21919` documents `defaultLaunchValue` as "Applied at the beginning
+/// of each graph execution **if CU_GRAPH_COND_ASSIGN_DEFAULT is set in
+/// flags**". Creating the handle with `flags = 0` therefore leaves the
+/// condition at 0 on entry and a WHILE body executes **zero** times — the
+/// graph launches, returns success, and generates nothing. Measured on
+/// `arc-v4-stack` (H200, CUDA 13.1): `flags=0` → body ran 0 times;
+/// `flags=CU_GRAPH_COND_ASSIGN_DEFAULT` → body ran exactly N times.
+#[cfg(feature = "cuda")]
+pub const CU_GRAPH_COND_ASSIGN_DEFAULT: u32 = 0x1;
+#[cfg(feature = "cuda")]
 pub type CUdevice = i32;
 
 #[cfg(feature = "cuda")]
@@ -70,6 +85,14 @@ pub enum CudaGraphNodeType {
     Conditional = 13,
 }
 
+/// `CUDA_CONDITIONAL_NODE_PARAMS`, `cuda.h:1958` (CUDA 13.1).
+///
+/// `phGraph_out` is an **OUT** field: "CUDA-owned array populated with
+/// conditional node child graphs during creation of the node." Callers leave
+/// it null and read it back after `cuGraphAddNode`; assigning a caller-owned
+/// pointer to it accomplishes nothing because the driver overwrites it.
+///
+/// `ctx` (the 5th field) was missing entirely from this struct.
 #[cfg(feature = "cuda")]
 #[repr(C)]
 pub struct CudaConditionalNodeParams {
@@ -77,6 +100,7 @@ pub struct CudaConditionalNodeParams {
     pub cond_type: CUgraphConditionalNodeType,
     pub size: u32,
     pub body_graph_out: *mut CUgraph,
+    pub ctx: CUcontext,
 }
 
 #[cfg(feature = "cuda")]
@@ -162,6 +186,7 @@ extern "C" {
     pub fn cuGraphLaunch(exec: CUgraphExec, stream: CUstream) -> u32;
     pub fn cuGraphExecDestroy(exec: CUgraphExec) -> u32;
     pub fn cuGraphDestroy(graph: CUgraph) -> u32;
+    pub fn cuGraphGetNodes(graph: CUgraph, nodes: *mut CUgraphNode, num_nodes: *mut usize) -> u32;
 
     // ========== Memory pools ==========
     pub fn cuMemPoolCreate(pool: *mut CUmemoryPool, props: *const CUmemPoolProps) -> u32;
@@ -188,19 +213,52 @@ extern "C" {
     pub fn cudaStreamQuery(stream: CUstream) -> u32;
 
     // ========== Conditional nodes (CUDA 12.4+) ==========
-    pub fn cudaGraphConditionalHandleCreate(
+    /// `cuda.h:21932` (CUDA 13.1) — the driver form takes a `CUcontext`,
+    /// which the conditional node params must match ("Context on which to run
+    /// the node. Must match context used to create the handle and all body
+    /// nodes", `cuda.h:1986`).
+    pub fn cuGraphConditionalHandleCreate(
         handle: *mut CUgraphConditionalHandle,
         graph: CUgraph,
-        default_value: u32,
+        ctx: CUcontext,
+        default_launch_value: u32,
         flags: u32,
     ) -> u32;
-    pub fn cudaGraphSetConditional(handle: CUgraphConditionalHandle, value: u32) -> u32;
-    pub fn cudaGraphAddNode(
-        graph: CUgraph,
+    pub fn cuCtxGetCurrent(ctx: *mut CUcontext) -> u32;
+    /// `cuda.h:21829` (CUDA 13.1):
+    /// ```text
+    /// CUresult cuGraphAddNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+    ///                         const CUgraphNode *dependencies,
+    ///                         const CUgraphEdgeData *dependencyData,
+    ///                         size_t numDependencies,
+    ///                         CUgraphNodeParams *nodeParams);
+    /// ```
+    /// The OUT node pointer is the **first** argument and there are **six** of
+    /// them. This was previously declared as
+    /// `cudaGraphAddNode(graph, node_out, deps, num_deps, params)` — five
+    /// arguments with the first two transposed — so the driver received the
+    /// `CUgraph` handle in the slot where it expected `CUgraphNode *` and
+    /// wrote the new node handle through that value, while `numDependencies`
+    /// received a pointer and `nodeParams` an uninitialised register.
+    pub fn cuGraphAddNode(
         node_out: *mut CUgraphNode,
+        graph: CUgraph,
         dependencies: *const CUgraphNode,
+        dependency_data: *const std::ffi::c_void,
         num_dependencies: usize,
         params: *mut CudaGraphNodeParams,
+    ) -> u32;
+    /// `cuda.h:15665` (CUDA 13.1). `cuda.h:1976` names this as a supported way
+    /// to populate a conditional node's body graph. Ordinary
+    /// `cuStreamBeginCapture_v2` always creates a **new** graph, so a body
+    /// captured that way cannot be attached to the conditional node.
+    pub fn cuStreamBeginCaptureToGraph(
+        stream: CUstream,
+        graph: CUgraph,
+        dependencies: *const CUgraphNode,
+        dependency_data: *const std::ffi::c_void,
+        num_dependencies: usize,
+        mode: CUstreamCaptureMode,
     ) -> u32;
 
     // ========== Pinned host memory ==========

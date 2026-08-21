@@ -351,6 +351,30 @@ static BASELINE: &[Waiver] = &[
         kind: Kind::Unresolved,
         why: "candle is an out-of-tree path dependency",
     },
+    // The CUDA driver header. #130's FFI declarations cite it by line for the
+    // struct layouts and flag values they mirror (`CUDA_CONDITIONAL_NODE_PARAMS`,
+    // `CU_GRAPH_COND_ASSIGN_DEFAULT`, the conditional-node entry points). It
+    // ships with the CUDA Toolkit and is not vendored here, so no citation into
+    // it can ever resolve — and its line numbers are toolkit-version-specific
+    // besides (these are CUDA 13.1), which is why each citation names the
+    // version in its surrounding comment.
+    //
+    // Waived by bare filename rather than one row per line number: the rows
+    // would otherwise have to be rewritten on every toolkit bump, which is
+    // churn the gate cannot check either way. The layouts themselves ARE
+    // checked, against `cudarc`'s bindgen output — see the ABI note on #130.
+    Waiver {
+        doc: "arc-cuda-graph/src/ffi.rs",
+        cite: "cuda.h",
+        kind: Kind::Unresolved,
+        why: "CUDA Toolkit header, not vendored here",
+    },
+    Waiver {
+        doc: "arc-cuda-graph/src/autonomous.rs",
+        cite: "cuda.h",
+        kind: Kind::Unresolved,
+        why: "CUDA Toolkit header, not vendored here",
+    },
     Waiver {
         doc: "memory/mission/wave29-BD-rung-decision.md",
         cite: "STATUS.md",

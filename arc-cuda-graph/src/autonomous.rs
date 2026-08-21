@@ -78,6 +78,8 @@ pub struct AutonomousDecodeConfig {
     pub top_p: f32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
+    /// `-1` disables top-k. The previous in-graph sampler had no top-k at all.
+    pub top_k: i32,
     pub greedy: bool,
 }
 
@@ -101,7 +103,19 @@ pub struct AutonomousDecodeRunner {
     /// True if the graph uses a WHILE conditional node (CUDA 12.4+).
     /// False if host-driven loop (body graph launched per step).
     uses_while_node: bool,
-    rng_offset: u64,
+    /// The real sampler: temperature + top-k + top-p, with its RNG state held
+    /// in **device memory** and advanced by the kernel.
+    ///
+    /// 🔴 The sampler this replaces (`launch_fused_top_p_bf16`) took
+    /// `rng_offset` as a **by-value kernel argument**. A captured graph bakes
+    /// kernel arguments at capture time, so every replayed step drew the
+    /// identical uniform and the host-side `rng_offset += 1` could not reach
+    /// an instantiated graph. It was also not nucleus sampling: it walked the
+    /// vocabulary in **token-id order** accumulating full-distribution mass to
+    /// `top_p * u`, biasing hard toward low token ids (its own comment said
+    /// "Not quite right — proper top-p needs sorting"). A device-resident
+    /// `rng_state` is the only form that survives replay.
+    sampler: crate::sampling_cuda::CudaSampler,
 }
 
 #[cfg(feature = "cuda")]
@@ -171,6 +185,17 @@ impl AutonomousDecodeRunner {
             std::ptr::write_bytes(ring_write_head_ptr as *mut u8, 0, batch * 4);
         }
 
+        // Bound to the runner's own stream so its kernels land inside the
+        // captured body rather than on the device-default stream.
+        let mut sampler = crate::sampling_cuda::CudaSampler::new(
+            device,
+            config.padded_batch_size,
+            config.vocab_size,
+            candle_core::DType::BF16,
+            0x5EED_A11C_E571_2345,
+        )?;
+        sampler.set_stream(stream);
+
         Ok(Self {
             config,
             device: device.clone(),
@@ -183,7 +208,7 @@ impl AutonomousDecodeRunner {
             ring_size,
             graph_exec: None,
             uses_while_node: false,
-            rng_offset: 0,
+            sampler,
         })
     }
 
@@ -350,10 +375,30 @@ impl AutonomousDecodeRunner {
             candle_core::bail!("cuGraphCreate failed: {status}");
         }
 
-        // 2. Create conditional handle (WHILE, default_value=1 = loop)
+        // 2. Create conditional handle (WHILE, default_value=1 = loop).
+        //
+        // `CU_GRAPH_COND_ASSIGN_DEFAULT` is REQUIRED: without it the default
+        // is never applied at launch, the condition reads 0, and the WHILE
+        // body runs zero times while every CUDA call still returns success.
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        let status = unsafe { cuCtxGetCurrent(&mut ctx) };
+        if status != CUDA_SUCCESS || ctx.is_null() {
+            unsafe {
+                cuGraphDestroy(outer_graph);
+            }
+            tracing::warn!("cuCtxGetCurrent failed ({status}), falling back to host-driven loop");
+            return self.capture_body_graph(forward_fn, bs, vocab);
+        }
         let mut cond_handle: CUgraphConditionalHandle = 0;
-        let status =
-            unsafe { cudaGraphConditionalHandleCreate(&mut cond_handle, outer_graph, 1, 0) };
+        let status = unsafe {
+            cuGraphConditionalHandleCreate(
+                &mut cond_handle,
+                outer_graph,
+                ctx,
+                1,
+                CU_GRAPH_COND_ASSIGN_DEFAULT,
+            )
+        };
         if status != CUDA_SUCCESS {
             unsafe {
                 cuGraphDestroy(outer_graph);
@@ -365,18 +410,19 @@ impl AutonomousDecodeRunner {
         // 3. Add conditional WHILE node to outer graph
         //    This creates an empty body graph that we populate via stream capture.
         let mut while_node: CUgraphNode = std::ptr::null_mut();
-        let mut body_graph: CUgraph = std::ptr::null_mut();
+        // `phGraph_out` is an OUT field the driver populates; leave it null.
         let mut params: CudaGraphNodeParams = unsafe { std::mem::zeroed() };
         params.node_type = CudaGraphNodeType::Conditional;
         params.conditional.handle = cond_handle;
         params.conditional.cond_type = CUgraphConditionalNodeType::WHILE;
         params.conditional.size = 1;
-        params.conditional.body_graph_out = &mut body_graph;
+        params.conditional.ctx = ctx;
 
         let status = unsafe {
-            cudaGraphAddNode(
-                outer_graph,
+            cuGraphAddNode(
                 &mut while_node,
+                outer_graph,
+                std::ptr::null(),
                 std::ptr::null(),
                 0,
                 &mut params,
@@ -390,19 +436,51 @@ impl AutonomousDecodeRunner {
             return self.capture_body_graph(forward_fn, bs, vocab);
         }
 
-        // 4. Populate body graph via stream capture
+        // 4. Populate the conditional node's OWN body graph.
+        //
+        // The driver hands back the body graph in `phGraph_out`; capture
+        // straight into it with `cuStreamBeginCaptureToGraph`. The previous
+        // code captured with `cuStreamBeginCapture_v2` — which always creates
+        // a NEW graph — and then destroyed the result, leaving the conditional
+        // body EMPTY. An empty body generates no tokens.
+        let body_graph: CUgraph = unsafe {
+            if params.conditional.body_graph_out.is_null() {
+                cuGraphDestroy(outer_graph);
+                candle_core::bail!("conditional node returned no body graph array");
+            }
+            *params.conditional.body_graph_out
+        };
+        if body_graph.is_null() {
+            unsafe {
+                cuGraphDestroy(outer_graph);
+            }
+            candle_core::bail!("conditional node body graph is null");
+        }
+
         unsafe {
-            let status = cuStreamBeginCapture_v2(self.stream, CUstreamCaptureMode::THREAD_LOCAL);
+            // RELAXED, not THREAD_LOCAL: candle's allocator and helper streams
+            // create cross-stream dependencies that THREAD_LOCAL rejects with
+            // CUDA_ERROR_STREAM_CAPTURE_ISOLATION (same reason `graph.rs`
+            // uses RELAXED).
+            let status = cuStreamBeginCaptureToGraph(
+                self.stream,
+                body_graph,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CUstreamCaptureMode::RELAXED,
+            );
             if status != CUDA_SUCCESS {
                 cuGraphDestroy(outer_graph);
-                candle_core::bail!("cuStreamBeginCapture for WHILE body failed: {status}");
+                candle_core::bail!("cuStreamBeginCaptureToGraph for WHILE body failed: {status}");
             }
         }
 
         // Capture: forward → sample → step_update → check_done_conditional
         self.capture_body_kernels(forward_fn, bs, vocab, Some(cond_handle))?;
 
-        // End capture into the body graph
+        // Ends the capture; returns the graph we captured INTO (`body_graph`),
+        // which is already attached to the conditional node.
         let mut captured_body: CUgraph = std::ptr::null_mut();
         unsafe {
             let status = cuStreamEndCapture(self.stream, &mut captured_body);
@@ -411,29 +489,37 @@ impl AutonomousDecodeRunner {
                 candle_core::bail!("cuStreamEndCapture for WHILE body failed: {status}");
             }
         }
-
-        // The captured_body needs to be merged into the body_graph that
-        // cudaGraphAddNode created. For CUDA 12.4 conditional nodes,
-        // the body_graph_out is pre-created and we should have captured
-        // INTO it by using it as the capture target. However, stream
-        // capture always creates a new graph.
-        //
-        // The correct approach: don't use stream capture for the body.
-        // Instead, add kernel nodes to body_graph directly. But that's
-        // extremely complex (need to manually create kernel nodes for
-        // every cuBLAS call, every custom kernel, etc.).
-        //
-        // Alternative: use cudaStreamBeginCaptureToGraph (CUDA 12.3+)
-        // which captures into an existing graph.
-        //
-        // For now: instantiate the outer graph. If the body graph was
-        // properly populated by the conditional node setup, it works.
-        // If not, we destroy and fall back.
-        unsafe {
-            cuGraphDestroy(captured_body);
+        if captured_body != body_graph {
+            unsafe {
+                cuGraphDestroy(outer_graph);
+            }
+            candle_core::bail!(
+                "capture-to-graph returned a different graph than the conditional body"
+            );
         }
+        // Assert the body actually received nodes. A conditional node with an
+        // empty body is the failure this function exists to prevent, and it is
+        // invisible at launch: the graph runs and produces nothing.
+        let mut body_nodes: usize = 0;
+        let status = unsafe { cuGraphGetNodes(body_graph, std::ptr::null_mut(), &mut body_nodes) };
+        if status != CUDA_SUCCESS || body_nodes == 0 {
+            unsafe {
+                cuGraphDestroy(outer_graph);
+            }
+            candle_core::bail!(
+                "WHILE body graph has {body_nodes} nodes after capture (status {status}) — \
+                 the decode body did not record"
+            );
+        }
+        tracing::info!("CUDA graph: WHILE body captured with {body_nodes} nodes");
 
-        // 5. Instantiate outer graph
+        // 5. Instantiate outer graph.
+        //
+        // NOTE: no AUTO_FREE_ON_LAUNCH here. `cuda.h:1971` restricts a
+        // conditional body to "kernel nodes, empty nodes, child graphs,
+        // memsets, memcopies, and conditionals" — memory alloc/free nodes are
+        // NOT in that list, so the captured decode body must be
+        // allocation-free for this path to instantiate at all.
         let mut exec: CUgraphExec = std::ptr::null_mut();
         let status = unsafe {
             cuGraphInstantiate_v2(
@@ -510,7 +596,7 @@ impl AutonomousDecodeRunner {
     /// Capture the body kernels: forward → sample → step_update → check_done.
     /// Called during stream capture (kernels recorded, not executed).
     fn capture_body_kernels<F>(
-        &self,
+        &mut self,
         forward_fn: &F,
         bs: i32,
         vocab: i32,
@@ -521,48 +607,54 @@ impl AutonomousDecodeRunner {
     {
         // Forward pass
         let logits = forward_fn()?;
-        let logits_ptr = tensor_ptr(&logits)? as *const _;
 
-        // Sampling
-        let sampled_ptr = tensor_ptr(&self.decode_state.sampled_tokens)? as *mut _;
+        // Cheap handle clones so every immutable borrow of `self` is finished
+        // before we take `&mut self.sampler`.
+        let sampled = self.decode_state.sampled_tokens.clone();
 
-        unsafe {
-            if self.config.greedy {
-                launch_fused_argmax_bf16(
-                    logits_ptr,
-                    sampled_ptr,
-                    std::ptr::null_mut(),
+        // Penalties stay a separate in-place pre-pass over the logits. The
+        // fused sampler applies penalties from a [batch, vocab] count tensor
+        // (`freq_counts`), which we do not maintain; passing `None` there
+        // while leaving non-zero penalties in the config would drop them
+        // SILENTLY (`sampling_kernel.cu:167` — `fcnt = freq_counts ? .. :
+        // nullptr`). So apply them here and zero them in `cfg`.
+        if self.config.frequency_penalty != 0.0 || self.config.presence_penalty != 0.0 {
+            let logits_mut = tensor_ptr(&logits)? as *mut _;
+            let out_toks = tensor_ptr(&self.decode_state.output_tokens)? as *const i32;
+            let n_gen = tensor_ptr(&self.decode_state.n_generated)? as *const i32;
+            unsafe {
+                launch_apply_penalties(
+                    logits_mut,
+                    out_toks,
+                    n_gen,
+                    self.config.frequency_penalty,
+                    self.config.presence_penalty,
                     vocab,
+                    self.config.max_tokens as i32,
                     bs,
-                    self.stream,
-                );
-            } else {
-                if self.config.frequency_penalty != 0.0 || self.config.presence_penalty != 0.0 {
-                    launch_apply_penalties(
-                        logits_ptr as *mut _,
-                        tensor_ptr(&self.decode_state.output_tokens)? as *const i32,
-                        tensor_ptr(&self.decode_state.n_generated)? as *const i32,
-                        self.config.frequency_penalty,
-                        self.config.presence_penalty,
-                        vocab,
-                        self.config.max_tokens as i32,
-                        bs,
-                        self.stream,
-                    );
-                }
-                launch_fused_top_p_bf16(
-                    logits_ptr,
-                    sampled_ptr,
-                    self.config.temperature,
-                    self.config.top_p,
-                    vocab,
-                    bs,
-                    42,
-                    self.rng_offset,
                     self.stream,
                 );
             }
+        }
 
+        let cfg = crate::sampling_cpu::SamplingConfig {
+            temperature: self.config.temperature,
+            top_p: self.config.top_p,
+            top_k: self.config.top_k,
+            // applied above, in-place, so the kernel must not re-apply them
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            greedy: self.config.greedy,
+            eos_token_id: self.config.eos_token_id,
+        };
+        // Scoped so the mutable borrow ends before the immutable ones below.
+        {
+            self.sampler.sample(&logits, None, cfg, &sampled)?;
+        }
+
+        let sampled_ptr = tensor_ptr(&sampled)? as *mut i32;
+
+        unsafe {
             // Step update
             launch_decode_step_update(
                 sampled_ptr as *const i32,
@@ -621,9 +713,8 @@ impl AutonomousDecodeRunner {
             candle_core::Error::Msg("Graph not captured — call capture() first".into())
         })?;
 
-        // Reset state
-        self.decode_state
-            .reset(&self.device, self.config.padded_batch_size)?;
+        // Reset state in place — the captured graph holds these addresses.
+        self.decode_state.reset(self.stream)?;
         unsafe {
             std::ptr::write_bytes(
                 self.ring_write_head_ptr as *mut u8,
@@ -631,7 +722,6 @@ impl AutonomousDecodeRunner {
                 self.config.padded_batch_size * 4,
             );
         }
-        self.rng_offset += 1;
 
         if self.uses_while_node {
             // ============================================================
@@ -656,7 +746,9 @@ impl AutonomousDecodeRunner {
                     }
                     cudaStreamSynchronize(self.stream);
                 }
-                let cond = self.decode_state.loop_condition.to_vec1::<i64>()?;
+                // I32: the kernel writes `int32_t`. Reading this as i64
+                // consumed two adjacent kernel writes as one value.
+                let cond = self.decode_state.loop_condition.to_vec1::<i32>()?;
                 if cond[0] == 0 {
                     break;
                 }
@@ -668,7 +760,7 @@ impl AutonomousDecodeRunner {
             .decode_state
             .output_tokens
             .to_dtype(candle_core::DType::I64)?;
-        let n_gen = self.decode_state.n_generated.to_vec1::<i64>()?;
+        let n_gen = self.decode_state.n_generated.to_vec1::<i32>()?;
         let mut results = Vec::new();
         for b in 0..self.config.padded_batch_size {
             let n = n_gen[b] as usize;
