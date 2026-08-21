@@ -1106,6 +1106,31 @@ impl DedicatedDecodePath {
 #[cfg(feature = "cuda")]
 impl Drop for DedicatedDecodePath {
     fn drop(&mut self) {
+        // 🔴 Bind the context before freeing, exactly as `new()` does.
+        //
+        // `new()` binds first and its comment states the consequence of not
+        // doing so: "a SEGV in libcuda MOVAPS on the first cudaMalloc — no
+        // error code, just a fault", because the runtime's lazy-init walks a
+        // thread-local that has not been seeded. This `Drop` then performed the
+        // *same class* of raw Driver/Runtime calls — `cuGraphExecDestroy` plus
+        // a long list of `cudaFree` — with no bind at all.
+        //
+        // `unsafe impl Send`/`Sync` above make it legal for this value to be
+        // dropped on a thread that never touched CUDA, which is precisely what
+        // happens when the engine thread outlives `main` and teardown lands on
+        // a foreign thread. That asymmetry (bind in `new`, none in `drop`) is
+        // the second half of the teardown SIGSEGV this binary died from.
+        //
+        // Failure here is not fatal: if we cannot bind we are already in a
+        // teardown we cannot improve, and skipping the frees leaks into a
+        // process that is exiting anyway — strictly better than faulting.
+        if Self::bind_context(&self.weights).is_err() {
+            tracing::warn!(
+                "DedicatedDecodePath::drop: could not bind CUDA context; \
+                 skipping device frees to avoid faulting during teardown."
+            );
+            return;
+        }
         unsafe {
             if let Some(exec) = self.graph_exec {
                 cuGraphExecDestroy(exec);
