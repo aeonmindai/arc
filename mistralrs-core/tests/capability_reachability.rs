@@ -313,6 +313,19 @@ static REGISTRY: &[Capability] = &[
         },
         status: Status::Live,
     },
+    Capability {
+        name: "sampling: ARC_SAMPLE_ON_DEVICE keeps batched logits on the device",
+        parent: "ArcInfer / ArcSample",
+        check: Check::Symbol {
+            symbol: "sample_on_device_enabled",
+            defined_in: "mistralrs-core/src/pipeline/mod.rs",
+        },
+        // Default OFF (env_flag_is_set, value-parsed), consulted by the
+        // DefaultInstructions step arm before the batched logits host copy.
+        // If this goes dark, every batch B > 1 is back to a 66 MB/step serial
+        // D2H that also disqualifies all rows from the GPU sampler fast path.
+        status: Status::Live,
+    },
     // -- the ApiPromise class ------------------------------------------------
     Capability {
         name: "sampling: logit_bias reaches the sampler",

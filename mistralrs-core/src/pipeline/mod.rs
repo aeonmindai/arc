@@ -508,6 +508,12 @@ impl ForwardInputsResult {
 pub(crate) static LOGITS_HOST_COPIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Serialises tests that assert on [`LOGITS_HOST_COPIES`] deltas: the counter
+/// is process-global and `cargo test` runs tests concurrently, so two
+/// counter-delta tests interleaving would read each other's increments.
+#[cfg(test)]
+pub(crate) static LOGITS_HOST_COPIES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Move a batched forward result to `host` with a **single** transfer, before
 /// it is split into per-sequence views.
 ///
@@ -543,6 +549,88 @@ pub(crate) fn host_copy_batched_result(
     }
     LOGITS_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     raw.to_device(host)
+}
+
+/// Parent system: ArcInfer / ArcSample.
+///
+/// `ARC_SAMPLE_ON_DEVICE`: opt-in device-resident sampling for batched decode.
+/// Default OFF; parsed by value (`env_flag_is_set`, so `=0` is off), latched
+/// once per process.
+///
+/// WHY THIS FLAG EXISTS: at any `n_seqs > 1` the `DefaultInstructions` step
+/// arm copied the ENTIRE `[B, 1, vocab]` logits tensor to the host before
+/// sampling — at B=256 with V4's 129,280 vocab in BF16 that is 66.2 MB per
+/// decode step, serial, on the critical path — and `Sampler::sample`'s GPU
+/// fast path is gated on `!logits.device().is_cpu()`, so the copy itself then
+/// disqualified all 256 rows into the ~5.9 ms/token CPU pipeline the fast
+/// path exists to avoid. [`host_copy_batched_result`]'s own doc states the
+/// trap for a single sequence ("moving a B=1 batch to the host would silently
+/// disable it") and never followed the thought to B > 1: the GPU sampler was
+/// structurally unreachable at every batch above 1.
+///
+/// With the flag ON, [`split_batched_logits_for_sampling`] keeps
+/// fast-path-eligible rows on the device (token-sized D2H each) and gathers
+/// the rest into ONE batched D2H. OFF is bit-for-bit the shipped behaviour.
+pub(crate) fn sample_on_device_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mistralrs_quant::env_flag_is_set("ARC_SAMPLE_ON_DEVICE"))
+}
+
+/// Split a batched `[B, 1, vocab]` logits tensor into per-row tensors for
+/// sampling: rows whose sampler terminates on the device
+/// ([`crate::sampler::Sampler::device_sampling_terminates`]) stay as device
+/// views; the rows that genuinely need the CPU pipeline are shipped with at
+/// most ONE batched D2H. `row_eligible` is in logits-row order (the
+/// `seq_indices` order of the step arm, not sequence order).
+///
+/// Copy discipline — the O(B²) trap, same as [`host_copy_batched_result`]: a
+/// per-row view still references the whole `B * vocab` storage, and both
+/// `Tensor::to_device` and `Tensor::to_vec1` copy the ENTIRE storage
+/// (`CudaStorage::to_cpu_storage`, candle `9586979`, `tensor.rs:1949/2379`).
+/// So CPU-bound rows must be gathered into fresh row-sized storage
+/// (`index_select` allocates exactly the selected rows) *before* the single
+/// `to_device`. The `Tensor::from_vec` for the gather indices is a
+/// once-per-step H2D of `n_cpu` u32s (pitfall #5 concerns per-token tensor
+/// creation in forward hot loops; this one replaces a 66 MB D2H and only runs
+/// for mixed batches).
+pub(crate) fn split_batched_logits_for_sampling(
+    logits: &Tensor,
+    row_eligible: &[bool],
+) -> candle_core::Result<Vec<Tensor>> {
+    let n = row_eligible.len();
+    let n_cpu = row_eligible.iter().filter(|e| !**e).count();
+    // Every row stays on device: pure views, no transfer at all.
+    if n_cpu == 0 {
+        return (0..n).map(|i| logits.i(i)).collect();
+    }
+    LOGITS_HOST_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Every row needs the CPU pipeline: one whole-tensor D2H — exactly the
+    // flag-off behaviour.
+    if n_cpu == n {
+        let host = logits.to_device(&Device::Cpu)?;
+        return (0..n).map(|i| host.i(i)).collect();
+    }
+    // Mixed batch: gather ONLY the CPU-bound rows into fresh contiguous
+    // device storage, then one D2H of that gather.
+    let cpu_rows: Vec<u32> = row_eligible
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !**e)
+        .map(|(i, _)| u32::try_from(i).expect("batch row index fits u32"))
+        .collect();
+    let idx = Tensor::from_vec(cpu_rows, n_cpu, logits.device())?;
+    let host = logits.index_select(&idx, 0)?.to_device(&Device::Cpu)?;
+    let mut host_pos = 0usize;
+    let mut out = Vec::with_capacity(n);
+    for (i, eligible) in row_eligible.iter().enumerate() {
+        if *eligible {
+            out.push(logits.i(i)?);
+        } else {
+            out.push(host.i(host_pos)?);
+            host_pos += 1;
+        }
+    }
+    Ok(out)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -982,6 +1070,16 @@ pub trait Pipeline:
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
                 let mut embedding_logits = vec![None; input_seqs.len()];
 
+                // STEP_us instrumentation, ported verbatim from the
+                // PagedAttention arm below. That arm carried the only
+                // TOTAL/fwd/sample/other split in the codebase, and V4 cannot
+                // reach it (`DeepSeekV4Loader::supports_paged_attention` is
+                // false) — so the path V4 actually runs had never once
+                // reported how a step divides between GPU and host. The log
+                // format is byte-identical to the paged arm's on purpose:
+                // tooling that parses one parses both.
+                let __np_t_step_start = Instant::now();
+                let mut __np_t_fwd_us: f64 = 0.0;
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
                     let InputProcessorOutput {
@@ -1013,6 +1111,54 @@ pub trait Pipeline:
                     };
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
+                    __np_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;
+
+                    // Device-resident sampling (ARC_SAMPLE_ON_DEVICE, default
+                    // OFF): keep fast-path-eligible rows on the device instead
+                    // of hosting the whole batch — see
+                    // [`sample_on_device_enabled`] for why. Only the batched
+                    // CausalGeneration case changes; B=1 already stays on
+                    // device via `host_copy_batched_result`'s `n_seqs > 1`
+                    // condition, and RawLogits/Embeddings are host-consumed.
+                    let device_sampling = sample_on_device_enabled()
+                        && seq_indices.len() > 1
+                        && matches!(
+                            &raw_logits,
+                            ForwardInputsResult::CausalGeneration { logits }
+                                if !logits.device().is_cpu()
+                        );
+                    if device_sampling {
+                        let ForwardInputsResult::CausalGeneration { logits: batched } =
+                            &raw_logits
+                        else {
+                            unreachable!("device_sampling implies CausalGeneration")
+                        };
+                        let vocab = batched.dim(candle_core::D::Minus1)?;
+                        let is_cuda = batched.device().is_cuda();
+                        let row_eligible: Vec<bool> = seq_indices
+                            .iter()
+                            .map(|&seq_idx| {
+                                let return_logprobs = input_seqs[seq_idx].return_logprobs();
+                                input_seqs[seq_idx].sampler().device_sampling_terminates(
+                                    vocab,
+                                    is_cuda,
+                                    return_logprobs,
+                                )
+                            })
+                            .collect();
+                        // Still a `sync_span`: the batched-gather D2H (when any
+                        // row needs the CPU pipeline) is the same blocking
+                        // device wait the flag-off copy was.
+                        let rows = {
+                            let _s = arc_profiler::sync_span("logits_d2h");
+                            split_batched_logits_for_sampling(batched, &row_eligible)?
+                        };
+                        for (row, seq_idx) in rows.into_iter().zip(seq_indices) {
+                            logits[seq_idx] =
+                                Some(ForwardInputsResult::CausalGeneration { logits: row });
+                        }
+                        continue;
+                    }
 
                     // ONE host copy for the whole batch, *before* the
                     // per-sequence split. See `host_copy_batched_result`: the
@@ -1204,6 +1350,30 @@ pub trait Pipeline:
                 }
                 let end = Instant::now();
                 exec_duration += end.duration_since(start);
+                let __np_t_sample_us = end.duration_since(start).as_secs_f64() * 1e6;
+                let __np_t_total_us = __np_t_step_start.elapsed().as_secs_f64() * 1e6;
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    static SUM_TOTAL: AtomicU64 = AtomicU64::new(0);
+                    static SUM_FWD: AtomicU64 = AtomicU64::new(0);
+                    static SUM_SAMPLE: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                    SUM_TOTAL.fetch_add(__np_t_total_us as u64, Ordering::Relaxed);
+                    SUM_FWD.fetch_add(__np_t_fwd_us as u64, Ordering::Relaxed);
+                    SUM_SAMPLE.fetch_add(__np_t_sample_us as u64, Ordering::Relaxed);
+                    if n > 4 && (n - 4) % 25 == 0 {
+                        let nn = (n - 4) as f64;
+                        let total = SUM_TOTAL.load(Ordering::Relaxed) as f64 / nn;
+                        let fwd = SUM_FWD.load(Ordering::Relaxed) as f64 / nn;
+                        let samp = SUM_SAMPLE.load(Ordering::Relaxed) as f64 / nn;
+                        let other = total - fwd - samp;
+                        tracing::info!(
+                            "STEP_us avg over {} steps: TOTAL={:.0} fwd={:.0} sample={:.0} other={:.0} (=> {:.1} tok/s)",
+                            n - 4, total, fwd, samp, other, 1e6 / total
+                        );
+                    }
+                }
 
                 Ok(exec_duration)
             }
@@ -1800,6 +1970,9 @@ mod host_copy_tests {
 
     #[test]
     fn batched_host_copy_is_o1_in_batch_while_the_old_order_was_o_b_squared() {
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 7 is equal to none of the batch sizes used below and coprime with
         // all of them, so no assertion can pass by `b * v` aliasing `v`, `b`,
         // or `v * b` (DOCTRINE D12: the fixture must discriminate).
@@ -1922,6 +2095,241 @@ mod host_copy_tests {
                 "raw logits / embeddings always return to the host"
             );
         }
+    }
+}
+
+/// `ARC_SAMPLE_ON_DEVICE`'s partitioned split: copy discipline and seeded
+/// token parity, on CPU-checkable fixtures.
+///
+/// On a CPU fixture every "device-resident" row re-enters the same CPU
+/// sampling code, so what these tests prove is exactly the CPU-checkable
+/// half: the partition itself — row routing, ordering, and the one-batched-
+/// copy discipline — cannot change a sampled token or move more bytes than
+/// the rows it ships. GPU-side fast-path behaviour is the `Sampler`'s
+/// existing contract, not established here (D14).
+#[cfg(test)]
+mod device_sampling_split_tests {
+    use super::*;
+    use crate::sampler::Sampler;
+    use candle_core::{CpuStorage, Storage};
+    use rand::SeedableRng;
+    use rand_isaac::Isaac64Rng;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Elements candle would move across a device boundary for `t`: the whole
+    /// backing storage, not `t.elem_count()` (see `host_copy_tests`).
+    fn storage_elems(t: &Tensor) -> usize {
+        let (storage, _layout) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(CpuStorage::F32(v)) => v.len(),
+            _ => panic!("fixture must be a CPU F32 tensor"),
+        }
+    }
+
+    /// `[b, 1, v]` ramp `0..b*v`: every row identifies itself, so any
+    /// host-position mapping error in the gather produces a visible wrong
+    /// slice rather than a coincidentally-equal one.
+    fn batch(b: usize, v: usize) -> Tensor {
+        let vals: Vec<f32> = (0..b * v).map(|x| x as f32).collect();
+        Tensor::from_vec(vals, (b, 1, v), &Device::Cpu).unwrap()
+    }
+
+    fn row_values(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn mixed_batch_gathers_only_the_cpu_rows_in_one_copy() {
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const B: usize = 6;
+        const V: usize = 7;
+        let logits = batch(B, V);
+        let eligible = [true, false, true, false, false, true];
+        let n_cpu = 3usize;
+
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let rows = split_batched_logits_for_sampling(&logits, &eligible).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            1,
+            "a mixed batch is ONE batched copy, not one per CPU row"
+        );
+
+        assert_eq!(rows.len(), B);
+        for (k, row) in rows.iter().enumerate() {
+            assert_eq!(row.dims(), &[1, V], "row {k} shape");
+            let expect: Vec<f32> = (k * V..(k + 1) * V).map(|x| x as f32).collect();
+            assert_eq!(row_values(row), expect, "row {k} carries the wrong data");
+            if eligible[k] {
+                // Device-resident rows are views over the original storage:
+                // zero bytes moved for them.
+                assert_eq!(
+                    storage_elems(row),
+                    B * V,
+                    "row {k}: an eligible row must stay a view of the batch"
+                );
+            } else {
+                // CPU-bound rows share the gathered storage: exactly the
+                // selected rows crossed, not the batch (and not O(B²)).
+                assert_eq!(
+                    storage_elems(row),
+                    n_cpu * V,
+                    "row {k}: the gather must materialise ONLY the CPU rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_eligible_moves_nothing_and_none_eligible_matches_flag_off() {
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const B: usize = 4;
+        const V: usize = 5;
+        let logits = batch(B, V);
+
+        // All rows terminate on device: no host copy at all.
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let rows = split_batched_logits_for_sampling(&logits, &[true; B]).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            0,
+            "an all-eligible batch must not touch the host"
+        );
+        for (k, row) in rows.iter().enumerate() {
+            assert_eq!(storage_elems(row), B * V, "row {k} must be a view");
+        }
+
+        // No row terminates on device: one whole-batch copy — the flag-off
+        // behaviour exactly (same counter delta as host_copy_batched_result).
+        let before = LOGITS_HOST_COPIES.load(Ordering::Relaxed);
+        let rows = split_batched_logits_for_sampling(&logits, &[false; B]).unwrap();
+        assert_eq!(
+            LOGITS_HOST_COPIES.load(Ordering::Relaxed) - before,
+            1,
+            "an all-CPU batch is one batched copy, exactly like flag-off"
+        );
+        for (k, row) in rows.iter().enumerate() {
+            let expect: Vec<f32> = (k * V..(k + 1) * V).map(|x| x as f32).collect();
+            assert_eq!(row_values(row), expect, "row {k} after whole-batch copy");
+        }
+    }
+
+    /// Seeded sampling through the partition must produce IDENTICAL tokens to
+    /// the flag-off path (batched host copy + `index_bs` split), row for row,
+    /// for any eligibility mask. Rows sample in row order on a shared seeded
+    /// rng in both paths, so any reordering, extra draw, or wrong-row routing
+    /// shifts the stream and fails.
+    #[test]
+    fn seeded_tokens_identical_to_the_flag_off_split() {
+        // Not asserting on counter deltas, but this test INCREMENTS the
+        // global counter (both split paths), so it must still serialise with
+        // the tests that do assert.
+        let _serial = LOGITS_HOST_COPIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const B: usize = 4;
+        const V: usize = 64;
+
+        // Deterministic spread-out logits (LCG as in sampler parity tests).
+        let mut state: u64 = 0xA5A5 ^ 0xDEAD_BEEF_CAFE_F00D;
+        let vals: Vec<f32> = (0..B * V)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 32) as u32 as f32 / u32::MAX as f32) * 12.0 - 6.0
+            })
+            .collect();
+        let logits = Tensor::from_vec(vals, (B, 1, V), &Device::Cpu).unwrap();
+
+        // One sampler shape per row: greedy, top-k, server defaults, top-p.
+        let mk = |temperature: Option<f64>, top_k: i64, top_p: f64| {
+            Sampler::new(
+                temperature,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                top_k,
+                top_p,
+                0.0,
+                None,
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+        let samplers = [
+            mk(None, -1, 1.0),
+            mk(Some(0.7), 8, 1.0),
+            mk(Some(1.0), -1, 1.0),
+            mk(Some(0.7), -1, 0.9),
+        ];
+
+        // Mirrors `sample_sequence`'s per-row prologue.
+        let sample_rows = |rows: &[Tensor]| -> Vec<u32> {
+            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+            rows.iter()
+                .zip(samplers.iter())
+                .map(|(row, sampler)| {
+                    let row = row
+                        .squeeze(0)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap();
+                    sampler
+                        .sample(row, &[1u32, 2, 3], false, rng.clone(), false, true)
+                        .unwrap()
+                        .token
+                })
+                .collect()
+        };
+
+        // Flag-off: batched host copy, then the per-sequence split.
+        let flag_off_rows: Vec<Tensor> = {
+            let host = host_copy_batched_result(
+                ForwardInputsResult::CausalGeneration {
+                    logits: logits.clone(),
+                },
+                B,
+                &Device::Cpu,
+            )
+            .unwrap();
+            (0..B)
+                .map(|k| match host.index_bs(k).unwrap() {
+                    ForwardInputsResult::CausalGeneration { logits } => logits,
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        let expected = sample_rows(&flag_off_rows);
+
+        // Flag-on, under every mask shape the partition can take.
+        for mask in [
+            [true, true, true, true],
+            [false, false, false, false],
+            [true, false, true, false],
+            [false, true, false, true],
+        ] {
+            let rows = split_batched_logits_for_sampling(&logits, &mask).unwrap();
+            assert_eq!(
+                sample_rows(&rows),
+                expected,
+                "mask {mask:?}: partitioned rows must sample the same tokens"
+            );
+        }
+
+        // Pin the expected tokens: if the sampler's rng consumption ever
+        // changes shape, this fails here rather than passing vacuously as
+        // both-sides-moved parity.
+        assert_eq!(expected, vec![23, 42, 31, 22], "seeded fixture drifted");
     }
 }
 
