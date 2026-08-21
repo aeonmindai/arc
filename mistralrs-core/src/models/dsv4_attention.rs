@@ -84,6 +84,30 @@ use crate::attention::SdpaParams;
 use crate::layers::Sdpa;
 use crate::pipeline::text_models_inputs_processor::FlashParams;
 
+/// A `-inf` fill built **directly in `dtype`**, instead of built in F32 and
+/// narrowed.
+///
+/// Bit-identical to `Tensor::full(f32::NEG_INFINITY, shape, dev)?.to_dtype(dtype)?`
+/// for every dtype it special-cases: IEEE-754 narrowing maps `-inf` to `-inf`
+/// exactly, in every rounding mode, so no value moves. What it removes is the
+/// cast — one launch per layer per decode step over a tensor whose every
+/// element is the same constant. Dtypes with no `-inf` representation (the
+/// integer and FP8 families) fall through to the old two-step spelling, so this
+/// can only ever delete a launch, never change an answer.
+fn neg_inf_full<S: Into<candle_core::Shape>>(
+    shape: S,
+    dtype: DType,
+    dev: &Device,
+) -> Result<Tensor> {
+    match dtype {
+        DType::BF16 => Tensor::full(half::bf16::NEG_INFINITY, shape, dev),
+        DType::F16 => Tensor::full(half::f16::NEG_INFINITY, shape, dev),
+        DType::F32 => Tensor::full(f32::NEG_INFINITY, shape, dev),
+        DType::F64 => Tensor::full(f64::NEG_INFINITY, shape, dev),
+        _ => Tensor::full(f32::NEG_INFINITY, shape, dev)?.to_dtype(dtype),
+    }
+}
+
 /// Kill-switch for the absorbed-MLA decode path (`ARC_V4_NO_ABSORBED_DECODE=1`
 /// restores the pre-fix `Sdpa.run_attention` repeat_kv expansion for on-GPU
 /// A/B triage, mirroring `ARC_FORCE_NAIVE_SDPA`).
@@ -377,7 +401,7 @@ fn ragged_union_mask(
     };
 
     let zeros = Tensor::zeros((b_sz, 1, t_q, n_keys), dtype, dev)?;
-    let neg_inf = Tensor::full(f32::NEG_INFINITY, (b_sz, 1, t_q, n_keys), dev)?.to_dtype(dtype)?;
+    let neg_inf = neg_inf_full((b_sz, 1, t_q, n_keys), dtype, dev)?;
     valid.contiguous()?.where_cond(&zeros, &neg_inf)
 }
 
@@ -544,7 +568,7 @@ pub(crate) fn graph_compressed_mask(
     let threshold = ((pos + 1.0)? / ratio as f64)?.floor()?; // [B, 1]
     let valid = blocks.broadcast_lt(&threshold)?; // [B, t_c] (u8)
     let zeros = Tensor::zeros((b, t_c), dtype, dev)?;
-    let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, t_c), dev)?.to_dtype(dtype)?;
+    let neg_inf = neg_inf_full((b, t_c), dtype, dev)?;
     let comp = valid
         .where_cond(&zeros, &neg_inf)?
         .reshape((b, 1, 1, t_c))?;
@@ -831,16 +855,55 @@ pub fn dsv4_attention(
     // valid, so no query row is fully masked (no softmax NaN). `kp` carries the
     // ABSOLUTE position of each retained key, so the comparison against `qp` is
     // unchanged by the narrowing above.
-    let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
-        .to_dtype(DType::F32)?
-        .reshape((1, t_k))?;
-    let qp = Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
-        .to_dtype(DType::F32)?
-        .reshape((t_q, 1))?;
-    let causal = kp.broadcast_le(&qp)?;
-    let lower = (&qp - window as f64)?;
-    let in_window = kp.broadcast_gt(&lower)?;
-    let raw_valid = (causal * in_window)?; // [t_q, t_k] (u8)
+    //
+    // 🔑 At `t_q == 1` — i.e. on every decode step — this tensor is ALL ONES,
+    // and the eight launches that build it (two host->device `arange` uploads,
+    // two U32->F32 casts and four elementwise ops) collapse to one fill. That
+    // is an identity, not an approximation, and it does not depend on the
+    // context length:
+    //
+    //   `raw_keep_span(1, window, t_k_full)` gives `keep = min(window, t_k_full)`
+    //   and `raw_base = t_k_full - keep`, while `q0 = t_k_full - t_q =
+    //   t_k_full - 1`. So the retained keys are exactly
+    //   `[t_k_full - keep, t_k_full)`, and every one of them satisfies
+    //     * `j <= q0`, because the largest is `t_k_full - 1`, which IS `q0`;
+    //     * `j > q0 - window`, because the smallest is
+    //       `t_k_full - min(window, t_k_full)` — which is `t_k_full - window`,
+    //       one greater than `t_k_full - 1 - window`, when the cache is at
+    //       least a window long, and `0` against a negative bound when it is
+    //       shorter.
+    //   `causal * in_window` is U8, so every element of the product is exactly
+    //   `1`: `Tensor::ones` is bit-identical here, not merely equivalent.
+    //
+    // The two deleted uploads are worth more than the two deleted casts: an
+    // `arange` copies from a HOST pointer, and host-pointer copies are the
+    // class that makes a decode step expensive to capture as a CUDA graph.
+    let decode_row = t_q == 1;
+    // `qp` outlives this block only to drive the compressed branch's threshold,
+    // and only on the paths that still evaluate that threshold in F32.
+    let qp = if decode_row {
+        None
+    } else {
+        Some(
+            Tensor::arange(q0 as u32, (q0 + t_q) as u32, dev)?
+                .to_dtype(DType::F32)?
+                .reshape((t_q, 1))?,
+        )
+    };
+    let raw_valid = if decode_row {
+        Tensor::ones((t_q, t_k), DType::U8, dev)?
+    } else {
+        let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, t_k))?;
+        let qp = qp
+            .as_ref()
+            .expect("qp is built on exactly the `t_q > 1` branch this arm is");
+        let causal = kp.broadcast_le(qp)?;
+        let lower = (qp - window as f64)?;
+        let in_window = kp.broadcast_gt(&lower)?;
+        (causal * in_window)? // [t_q, t_k] (u8)
+    };
 
     // ---- Build the union key set + validity mask. -------------------------
     let (k_cat, v_cat, valid) = match compressed_kv {
@@ -857,13 +920,33 @@ pub fn dsv4_attention(
                 // carry the real pattern — a `0` here is the additive identity,
                 // so the two compose without double-counting.
                 Some(_) => Tensor::ones((t_q, t_c), DType::U8, dev)?,
-                None => {
-                    let bp = Tensor::arange(0u32, t_c as u32, dev)?
-                        .to_dtype(DType::F32)?
-                        .reshape((1, t_c))?;
-                    let threshold = ((&qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
-                    bp.broadcast_lt(&threshold)? // [t_q, t_c] (u8)
-                }
+                None => match &qp {
+                    // Decode (`t_q == 1`). `q0` is a host value and
+                    // `CompressRatio::ratio` is 1 / 4 / 128 — always a power of
+                    // two — so `floor((q0 + 1) / ratio)` is exact integer
+                    // arithmetic on the host and `bp` can stay in the U32 the
+                    // `arange` already produced. Bit-identical to the F32 chain
+                    // below: `q0 + 1`, the quotient and every block index are
+                    // integers, a power-of-two divide is exact in binary
+                    // floating point, and F32 represents every integer below
+                    // 2^24 = 16 777 216 — against V4's 163 840-token position
+                    // ceiling. Same predicate, same operands, four fewer
+                    // launches (a cast, an add, a divide and a floor).
+                    None => {
+                        let threshold =
+                            Tensor::new(&[((q0 + 1) / ratio) as u32], dev)?.reshape((1, 1))?;
+                        Tensor::arange(0u32, t_c as u32, dev)?
+                            .reshape((1, t_c))?
+                            .broadcast_lt(&threshold)? // [1, t_c] (u8)
+                    }
+                    Some(qp) => {
+                        let bp = Tensor::arange(0u32, t_c as u32, dev)?
+                            .to_dtype(DType::F32)?
+                            .reshape((1, t_c))?;
+                        let threshold = ((qp + 1.0)? / ratio as f64)?.floor()?; // [t_q, 1]
+                        bp.broadcast_lt(&threshold)? // [t_q, t_c] (u8)
+                    }
+                },
             };
             let valid = Tensor::cat(&[&raw_valid, &comp_valid], 1)?;
             let k_cat = Tensor::cat(&[k, comp], 2)?.contiguous()?;
@@ -892,8 +975,7 @@ pub fn dsv4_attention(
         // Uniform batch: verbatim the pre-change code.
         None => {
             let zeros = Tensor::zeros((t_q, n_keys), q.dtype(), dev)?;
-            let neg_inf =
-                Tensor::full(f32::NEG_INFINITY, (t_q, n_keys), dev)?.to_dtype(q.dtype())?;
+            let neg_inf = neg_inf_full((t_q, n_keys), q.dtype(), dev)?;
             valid
                 .where_cond(&zeros, &neg_inf)?
                 .reshape((1, 1, t_q, n_keys))?
@@ -2244,6 +2326,261 @@ mod tests {
         assert_eq!(raw_keep_span(1, 128, 2048), (1920, 128));
         // Prefill is untouched.
         assert_eq!(raw_keep_span(2048, 128, 2048), (0, 2048));
+    }
+
+    /// [`dsv4_attention`] replaces eight launches with a single `Tensor::ones`
+    /// at `t_q == 1`. This is the claim that shortcut rests on, checked against
+    /// the chain it replaced — spelled out here as the reference — over the
+    /// whole interesting range of `(window, t_k_full)`: cache shorter than the
+    /// window, exactly one window, and much longer.
+    ///
+    /// The `t_q == 2` case at the bottom is the control. It runs the SAME
+    /// reference and asserts it produces a masked column, so a reference that
+    /// had degenerated into "return ones" — which would make every assertion
+    /// above pass no matter what — fails here instead.
+    #[test]
+    fn a_single_query_rows_raw_window_mask_is_all_ones() -> Result<()> {
+        let dev = Device::Cpu;
+
+        // The pre-change chain, verbatim.
+        let reference = |t_q: usize, window: usize, t_k_full: usize| -> Result<Vec<u8>> {
+            let (raw_base, t_k) = raw_keep_span(t_q, window, t_k_full);
+            let q0 = t_k_full - t_q;
+            let kp = Tensor::arange(raw_base as u32, (raw_base + t_k) as u32, &dev)?
+                .to_dtype(DType::F32)?
+                .reshape((1, t_k))?;
+            let qp = Tensor::arange(q0 as u32, (q0 + t_q) as u32, &dev)?
+                .to_dtype(DType::F32)?
+                .reshape((t_q, 1))?;
+            let causal = kp.broadcast_le(&qp)?;
+            let lower = (&qp - window as f64)?;
+            let in_window = kp.broadcast_gt(&lower)?;
+            (causal * in_window)?.flatten_all()?.to_vec1::<u8>()
+        };
+
+        let mut cases = 0usize;
+        for window in [1usize, 2, 4, 128, 4096] {
+            for t_k_full in [1usize, 2, 3, window, window + 1, window * 7 + 3, 8192] {
+                let got = reference(1, window, t_k_full)?;
+                let (_, t_k) = raw_keep_span(1, window, t_k_full);
+                assert_eq!(got.len(), t_k);
+                assert!(
+                    got.iter().all(|&v| v == 1),
+                    "raw window mask at t_q=1 window={window} t_k_full={t_k_full} was \
+                     not all ones: {got:?}"
+                );
+                cases += 1;
+            }
+        }
+        assert!(cases >= 30, "the sweep visited only {cases} cases");
+
+        // Control: with two query rows the same reference MUST mask something,
+        // or the assertions above are satisfied by a broken reference.
+        let two_rows = reference(2, 4, 64)?;
+        assert!(
+            two_rows.contains(&0),
+            "control failed: the reference masked nothing at t_q=2, so the all-ones \
+             assertions above cannot distinguish a real identity from a vacuous one"
+        );
+        Ok(())
+    }
+
+    /// The compressed-branch threshold has two spellings: `t_q == 1` divides in
+    /// `usize` and compares in U32, `t_q > 1` divides in F32 and compares in
+    /// F32. They must select the same blocks for every `(q0, ratio)` a V4
+    /// sequence can reach.
+    ///
+    /// Both are built here from scratch, so this compares two implementations
+    /// rather than a value with itself. The poison case at the bottom shifts the
+    /// integer threshold by exactly one block and requires the comparison to go
+    /// red — a check that has never been observed failing proves nothing.
+    #[test]
+    fn the_decode_compressed_threshold_selects_the_same_blocks_as_the_f32_chain() -> Result<()> {
+        let dev = Device::Cpu;
+
+        // The F32 chain, which the `t_q > 1` arm still runs.
+        let f32_arm = |q0: usize, ratio: usize, t_c: usize| -> Result<Vec<u8>> {
+            let qp = Tensor::arange(q0 as u32, (q0 + 1) as u32, &dev)?
+                .to_dtype(DType::F32)?
+                .reshape((1, 1))?;
+            let bp = Tensor::arange(0u32, t_c as u32, &dev)?
+                .to_dtype(DType::F32)?
+                .reshape((1, t_c))?;
+            let threshold = ((&qp + 1.0)? / ratio as f64)?.floor()?;
+            bp.broadcast_lt(&threshold)?.flatten_all()?.to_vec1::<u8>()
+        };
+        // The U32 arm now taken at `t_q == 1`; `bump` poisons the threshold.
+        let u32_arm = |q0: usize, ratio: usize, t_c: usize, bump: u32| -> Result<Vec<u8>> {
+            let threshold =
+                Tensor::new(&[((q0 + 1) / ratio) as u32 + bump], &dev)?.reshape((1, 1))?;
+            Tensor::arange(0u32, t_c as u32, &dev)?
+                .reshape((1, t_c))?
+                .broadcast_lt(&threshold)?
+                .flatten_all()?
+                .to_vec1::<u8>()
+        };
+
+        let mut compared = 0usize;
+        let mut saw_partial = false;
+        for ratio in [1usize, 4, 128] {
+            for step in [0usize, 1, 2, 3, 4, 100, 1279] {
+                for extra in [0usize, ratio - 1] {
+                    let q0 = step * ratio + extra;
+                    let t_c = (q0 + 1) / ratio + 3;
+                    let expected = f32_arm(q0, ratio, t_c)?;
+                    assert_eq!(
+                        expected,
+                        u32_arm(q0, ratio, t_c, 0)?,
+                        "compressed-block selection diverged at q0={q0} ratio={ratio} \
+                         t_c={t_c}"
+                    );
+                    if expected.contains(&0) && expected.contains(&1) {
+                        saw_partial = true;
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared >= 30, "the sweep compared only {compared} cases");
+        assert!(
+            saw_partial,
+            "every compared mask was uniform, so the equalities above would hold for \
+             any threshold at all"
+        );
+
+        // Poison: one block of threshold shift must be visible.
+        assert_ne!(
+            f32_arm(128, 4, 64)?,
+            u32_arm(128, 4, 64, 1)?,
+            "control failed: a one-block threshold shift produced an identical mask, \
+             so the equalities above cannot detect a wrong threshold"
+        );
+        Ok(())
+    }
+
+    /// End-to-end, through the real dispatch: the decode threshold admits
+    /// compressed block `(q0 + 1) / ratio - 1` and refuses block
+    /// `(q0 + 1) / ratio`.
+    ///
+    /// Both halves are load-bearing and they fail in opposite directions, which
+    /// is what pins the boundary rather than merely observing it: a threshold
+    /// one block too high lets the refused block vote (half A goes red), one
+    /// block too low silences the admitted one (half B goes red). Every other
+    /// decode test in this module happens to run with the whole compressed axis
+    /// already causally valid, so none of them can see either error — measured,
+    /// by poisoning the threshold and watching all thirty-five stay green.
+    #[test]
+    fn the_decode_compressed_threshold_is_exact_at_the_boundary() -> Result<()> {
+        let device = Device::Cpu;
+        let (b, h, d, window) = (1usize, 2usize, 16usize, 4usize);
+        let (t_k, t_q, t_c) = (32usize, 1usize, 12usize);
+        let ratio = CompressRatio::Csa.ratio(); // 4
+        let q0 = t_k - t_q; // 31
+        let live_blocks = (q0 + 1) / ratio; // 8
+        assert!(
+            live_blocks > 0 && live_blocks + 1 < t_c,
+            "fixture must leave blocks on BOTH sides of the threshold: \
+             live={live_blocks} t_c={t_c}"
+        );
+
+        // `comp` with one row replaced by a value loud enough that admitting it
+        // could not be lost in the F32 noise floor.
+        let comp_loud_at = |row: usize| -> Result<Tensor> {
+            let base = mk(b, 1, t_c, d, 0.05, &device)?;
+            let loud = Tensor::full(9.0f32, (b, 1, 1, d), &device)?;
+            Tensor::cat(
+                &[
+                    &base.narrow(2, 0, row)?,
+                    &loud,
+                    &base.narrow(2, row + 1, t_c - row - 1)?,
+                ],
+                2,
+            )
+        };
+
+        let q = mk(b, h, t_q, d, 0.1, &device)?;
+        let k = mk(b, 1, t_k, d, 0.2, &device)?;
+        let (sdpa, _sinks) = sdpa_params_with_sinks(d, h, &device)?;
+        let flash = empty_flash_params();
+        let cfg = Dsv4AttentionConfig {
+            compress_ratio: CompressRatio::Csa,
+            sliding_window: window,
+            raw_prefix: 0,
+            row_q0: None,
+            graph_positions: None,
+        };
+        let run = |comp: &Tensor| -> Result<Vec<f32>> {
+            Ok(flat(&dsv4_attention(
+                &q,
+                &k,
+                &k,
+                Some(comp),
+                None,
+                &flash,
+                &sdpa,
+                cfg,
+            )?))
+        };
+
+        let baseline = run(&mk(b, 1, t_c, d, 0.05, &device)?)?;
+        // A: the first block PAST the threshold is masked, so perturbing it
+        // must not move a single output element.
+        let past = run(&comp_loud_at(live_blocks)?)?;
+        assert_eq!(
+            baseline, past,
+            "compressed block {live_blocks} is past the causal threshold at q0={q0} \
+             ratio={ratio}, but perturbing it changed the output — the threshold \
+             admits a block it must refuse"
+        );
+        // B: the last block BEFORE the threshold is attended, so perturbing it
+        // must move the output. Without this, A is satisfied by a threshold of
+        // zero.
+        let last_live = run(&comp_loud_at(live_blocks - 1)?)?;
+        assert!(
+            max_abs_diff(&baseline, &last_live) > 1e-3,
+            "compressed block {} is inside the causal threshold at q0={q0} \
+             ratio={ratio}, but perturbing it left the output unchanged — the \
+             threshold refuses a block it must admit",
+            live_blocks - 1
+        );
+        Ok(())
+    }
+
+    /// [`neg_inf_full`] exists to delete a cast, not to change a value.
+    #[test]
+    fn neg_inf_full_matches_the_f32_then_cast_spelling_bit_for_bit() -> Result<()> {
+        let dev = Device::Cpu;
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let direct = neg_inf_full((2, 3), dtype, &dev)?;
+            let two_step = Tensor::full(f32::NEG_INFINITY, (2, 3), &dev)?.to_dtype(dtype)?;
+            assert_eq!(
+                direct.dtype(),
+                dtype,
+                "neg_inf_full returned the wrong dtype"
+            );
+            let bits = |t: &Tensor| -> Result<Vec<u32>> {
+                Ok(t.to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect())
+            };
+            assert_eq!(
+                bits(&direct)?,
+                bits(&two_step)?,
+                "neg_inf_full disagreed with the F32-then-cast spelling for {dtype:?}"
+            );
+            // Without this the equality above would also hold if both spellings
+            // produced zeros.
+            assert!(
+                bits(&direct)?
+                    .iter()
+                    .all(|&b| f32::from_bits(b).is_infinite() && f32::from_bits(b) < 0.0),
+                "neg_inf_full({dtype:?}) did not produce -inf"
+            );
+        }
+        Ok(())
     }
 
     /// End-to-end identity: keys outside the retained span cannot influence the
