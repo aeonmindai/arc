@@ -96,6 +96,25 @@
 //! `max_spins` is a last-resort liveness backstop for a kernel that hangs
 //! without ever erroring. It is not the primary detector.
 //!
+//! # KNOWN LIMITATION — the burst holds the scheduler
+//!
+//! A burst enqueues `burst` decode steps back-to-back and does not return to
+//! the engine until they have all landed. **For that whole window the engine
+//! admits no new request**, so a request arriving mid-burst waits up to
+//! `burst` decode steps (default 4) before it is even considered.
+//!
+//! At batch 1 — the only shape [`admit`] accepts — that is harmless: there is
+//! one sequence, nothing to interleave with, and the alternative is a host
+//! round trip per token. It is **not** harmless above batch 1, where a burst
+//! would straddle sequences with different stop conditions and different
+//! admission urgency, and where the wasted tail after one sequence's EOS is
+//! multiplied by the batch. That is why `admit` refuses `batch_size != 1`
+//! outright rather than treating it as a tuning question.
+//!
+//! Anyone widening this past batch 1 owns that problem first. Raising `burst`
+//! trades admission latency for host round trips one-for-one, and the
+//! trade is only free while there is exactly one sequence in flight.
+//!
 //! # Layering
 //!
 //! Everything above the CUDA calls is expressed against the [`DeviceOps`]
