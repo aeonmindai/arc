@@ -131,7 +131,15 @@ mod cache_config_tests {
     use super::*;
     use candle_core::Device;
 
-    fn small_head_dim_model() -> ModelConfigMetadata {
+    /// A head dim the TurboQuant kernels have no instantiation for. 192 is a
+    /// real head dim (it is what the MLA models report) and is deliberately
+    /// *not* in `TURBOQUANT_CUDA_HEAD_DIMS`, so it exercises the fallback
+    /// without pretending an unrealistic geometry.
+    fn uninstantiated_head_dim_model() -> ModelConfigMetadata {
+        assert!(
+            !mistralrs_quant::turboquant::cuda_supports_head_dim(192),
+            "192 gained a kernel instantiation; pick another width for this fixture"
+        );
         ModelConfigMetadata {
             max_seq_len: 4096,
             num_layers: 2,
@@ -139,15 +147,16 @@ mod cache_config_tests {
             num_kv_heads: 2,
             num_attn_heads: 4,
             sliding_window: None,
-            k_head_dim: 64,
-            v_head_dim: 64,
+            k_head_dim: 192,
+            v_head_dim: 192,
             kv_cache_layout: KvCacheLayout::Standard,
         }
     }
 
-    /// A defaulted TurboQuant cache type on a head_dim-64 model must fall back
-    /// to `Auto` at cache-config construction time — the returned config (used
-    /// for both sizing and `CacheEngine` allocation) carries the resolved type.
+    /// A defaulted TurboQuant cache type on a model whose head dim has no
+    /// kernel instantiation must fall back to `Auto` at cache-config
+    /// construction time — the returned config (used for both sizing and
+    /// `CacheEngine` allocation) carries the resolved type.
     #[test]
     fn calculate_cache_config_falls_back_for_unsupported_turboquant() -> anyhow::Result<()> {
         let device = Device::Cpu;
@@ -157,7 +166,7 @@ mod cache_config_tests {
             DType::F16,
             PagedCacheType::TurboQuant,
             false,
-            &small_head_dim_model(),
+            &uninstantiated_head_dim_model(),
             &device,
             &[Some(device.clone())],
             true,
@@ -179,7 +188,7 @@ mod cache_config_tests {
             DType::F16,
             PagedCacheType::TurboQuant,
             true,
-            &small_head_dim_model(),
+            &uninstantiated_head_dim_model(),
             &device,
             &[Some(device.clone())],
             true,
@@ -307,9 +316,11 @@ pub fn calculate_cache_config(
     if !SUPPORTED_BLOCK_SIZE.contains(&block_size) {
         anyhow::bail!("Block size must be in {SUPPORTED_BLOCK_SIZE:?}, got {block_size}");
     }
-    // TurboQuant only supports standard-layout models with head_dim == 128;
-    // resolve to a supported cache type (or error, if the user explicitly
-    // forced TurboQuant) before any sizing or allocation happens.
+    // TurboQuant needs a standard KV layout, and a head dim its kernels are
+    // instantiated for — narrowed further to the *measured* widths when the
+    // type is the ambient default rather than an explicit request. Resolve to a
+    // supported cache type (or error, if the user explicitly forced TurboQuant)
+    // before any sizing or allocation happens.
     let cache_type = cache_type.resolve_for_model(config, cache_type_explicit)?;
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();

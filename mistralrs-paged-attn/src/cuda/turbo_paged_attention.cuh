@@ -1,391 +1,379 @@
 /**
- * TurboQuant Paged Attention Kernel
+ * TurboQuant device tables and generic rotation — shared by every TurboQuant
+ * CUDA kernel in this crate.
  *
- * A variant of the standard paged attention kernel that reads compressed KV cache
- * using TurboQuant codebook lookups instead of direct memory loads or FP8 dequantization.
+ * WHAT THIS FILE IS
+ * -----------------
+ * TurboQuant compresses a KV head vector by (1) recording its L2 norm, (2)
+ * applying the involutory rotation D·H·D to the unit vector, and (3) scalar
+ * quantizing each rotated coordinate against a Lloyd-Max codebook. Attention
+ * then runs *in the rotated domain*: because D·H·D is orthogonal, q·k is
+ * preserved under it, so the K dot product needs no inverse rotation at all.
+ * Only the V accumulation, which lands in the rotated basis, is rotated back
+ * once at the end.
  *
- * Key differences from standard paged attention:
- * 1. Q is pre-rotated via WHT before the Q·K loop (once per query)
- * 2. K is stored as packed indices; lookup centroids from codebook in shared memory
- * 3. K dot product operates in the rotated domain (no inverse rotation needed)
- * 4. V is stored as packed indices; dequantized inline via codebook lookup
- * 5. Norms are stored per-token and applied after the dot product
+ * DIMENSION SUPPORT
+ * -----------------
+ * The tables below cover head_dim 64, 128, 256 and 512. Both `D` (the sign
+ * diagonal) and the codebook are functions of the dimension, so a kernel
+ * cannot simply reuse the 128 tables at another width — the codebook centroids
+ * shrink as sqrt(1/d) because the rotated coordinates concentrate.
  *
- * This kernel handles the 4-bit key / 3-bit value (default) configuration.
- * The cache layout per block:
- *   k_cache: [num_blocks, num_kv_heads, packed_k_bytes_per_head, block_size]
- *   v_cache: [num_blocks, num_kv_heads, packed_v_bytes_per_head, block_size]
- *   k_norms: [num_blocks, num_kv_heads, block_size] (half)
- *   v_norms: [num_blocks, num_kv_heads, block_size] (half)
+ * PROVENANCE — DO NOT HAND-EDIT THE TABLES
+ * ----------------------------------------
+ * Every `__constant__` array below was emitted by
+ *   cargo run -p mistralrs-quant --example emit_turboquant_cuda_tables -- 64 128 256 512
+ * which calls the same `turboquant::wht::generate_signs` and
+ * `turboquant::codebook::get_codebook` that the Rust compressor uses. The
+ * values are therefore correct by construction rather than by transcription.
  *
- * Reference: TurboQuant ICLR 2026 (arXiv:2504.19874), 0xSero/turboquant Triton kernels.
+ * `turboquant::cuda_tables` re-derives them at test time and diffs against this
+ * file, so a hand-edit here fails `cargo test -p mistralrs-quant`. That test is
+ * the only thing standing between a silent sign-table drift and a cache that
+ * decodes to noise, which is why it parses this header directly.
+ *
+ * ARCH SPECIALISATION (D16)
+ * -------------------------
+ * `TQ_PREFETCH` selects the software-pipeline depth of the packed-K gather.
+ * Hopper and Blackwell have deeper memory latency to hide and enough registers
+ * to hide it, so they run a 2-deep pipeline; pre-Hopper parts run the flat
+ * loop. Both produce identical arithmetic — this is a scheduling choice, not a
+ * numerical one.
  */
+
+#pragma once
 
 #include <stdint.h>
 #include <cuda_fp16.h>
 #include <float.h>
 
-#ifndef WARP_SIZE
-#define WARP_SIZE 32
+// ---------------------------------------------------------------------------
+// Arch specialisation
+// ---------------------------------------------------------------------------
+// Hopper (SM90) and Blackwell (SM100/SM103) hide global latency better with a
+// software-pipelined gather; older parts are latency-bound on the extra
+// registers instead. Identical results either way.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#define TQ_PREFETCH 2
+#else
+#define TQ_PREFETCH 1
 #endif
-#define MAX_TQ(a, b) ((a) > (b) ? (a) : (b))
-#define MIN_TQ(a, b) ((a) < (b) ? (a) : (b))
-#define DIVIDE_ROUND_UP_TQ(a, b) (((a) + (b) - 1) / (b))
 
-// ============================================================================
-// Codebooks (same values as turbo_wht.cu)
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Tables — generated, see PROVENANCE above.
+// ---------------------------------------------------------------------------
 
-__constant__ float TQ_CODEBOOK_4BIT[16] = {
-    -0.237664013127f, -0.180836062501f, -0.141805261760f, -0.110288414632f,
-    -0.082828489390f, -0.057772320256f, -0.034151583096f, -0.011302500645f,
-     0.011302500645f,  0.034151583096f,  0.057772320256f,  0.082828489390f,
-     0.110288414632f,  0.141805261760f,  0.180836062501f,  0.237664013127f,
+// ==== head_dim = 64 (seed 42) ====
+static __constant__ float TQ_SGN_64[64] = {
+     1,-1, 1,-1, 1, 1,-1,-1,-1,-1, 1, 1, 1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1, 1,
+     1,-1,-1, 1,-1,-1, 1, 1,-1, 1, 1,-1,-1,-1, 1,-1,
+    -1,-1,-1, 1, 1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,
+};
+static __constant__ float TQ_CB3_64[8] = {
+    -0.263914018869f,-0.166167899966f,-0.093832284212f,-0.030469184741f,
+    0.030469184741f,0.093832284212f,0.166167899966f,0.263914018869f,
+};
+static __constant__ float TQ_BD3_64[9] = {
+    -1.000000000000f,-0.215040951967f,-0.130000084639f,-0.062150731683f,
+    0.000000000000f,0.062150731683f,0.130000084639f,0.215040951967f,
+    1.000000000000f,
+};
+static __constant__ float TQ_CB4_64[16] = {
+    -0.330796420574f,-0.252913773060f,-0.198856174946f,-0.154925554991f,
+    -0.116486772895f,-0.081311784685f,-0.048089791089f,-0.015919025987f,
+    0.015919025987f,0.048089791089f,0.081311784685f,0.116486772895f,
+    0.154925554991f,0.198856174946f,0.252913773060f,0.330796420574f,
+};
+static __constant__ float TQ_BD4_64[17] = {
+    -1.000000000000f,-0.291855096817f,-0.225884988904f,-0.176890864968f,
+    -0.135706171393f,-0.098899275064f,-0.064700789750f,-0.032004408538f,
+    0.000000000000f,0.032004408538f,0.064700789750f,0.098899275064f,
+    0.135706171393f,0.176890864968f,0.225884988904f,0.291855096817f,
+    1.000000000000f,
 };
 
-__constant__ float TQ_CODEBOOK_3BIT[8] = {
-    -0.188397319183f, -0.118139828402f, -0.066585638471f, -0.021604320011f,
-     0.021604320011f,  0.066585638471f,  0.118139828402f,  0.188397319183f,
+// ==== head_dim = 128 (seed 42) ====
+static __constant__ float TQ_SGN_128[128] = {
+    -1,-1, 1,-1, 1,-1,-1, 1,-1,-1, 1, 1,-1,-1,-1,-1,
+    -1, 1,-1,-1, 1, 1, 1, 1, 1, 1,-1,-1,-1, 1, 1,-1,
+    -1,-1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1,
+    -1,-1,-1, 1,-1,-1, 1, 1,-1,-1,-1,-1, 1,-1, 1,-1,
+     1, 1, 1,-1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1, 1, 1, 1,-1,-1,-1, 1, 1, 1,-1,-1,-1,
+    -1,-1,-1,-1, 1, 1,-1, 1, 1,-1,-1, 1, 1,-1, 1,-1,
+};
+static __constant__ float TQ_CB3_128[8] = {
+    -0.188397318125f,-0.118139825761f,-0.066585637629f,-0.021604320034f,
+    0.021604320034f,0.066585637629f,0.118139825761f,0.188397318125f,
+};
+static __constant__ float TQ_BD3_128[9] = {
+    -1.000000000000f,-0.153268575668f,-0.092362731695f,-0.044094979763f,
+    0.000000000000f,0.044094979763f,0.092362731695f,0.153268575668f,
+    1.000000000000f,
+};
+static __constant__ float TQ_CB4_128[16] = {
+    -0.237664014101f,-0.180836066604f,-0.141805261374f,-0.110288411379f,
+    -0.082828491926f,-0.057772319764f,-0.034151583910f,-0.011302500963f,
+    0.011302500963f,0.034151583910f,0.057772319764f,0.082828491926f,
+    0.110288411379f,0.141805261374f,0.180836066604f,0.237664014101f,
+};
+static __constant__ float TQ_BD4_128[17] = {
+    -1.000000000000f,-0.209250032902f,-0.161320656538f,-0.126046836376f,
+    -0.096558451653f,-0.070300407708f,-0.045961949974f,-0.022727042437f,
+    0.000000000000f,0.022727042437f,0.045961949974f,0.070300407708f,
+    0.096558451653f,0.126046836376f,0.161320656538f,0.209250032902f,
+    1.000000000000f,
 };
 
-__constant__ float TQ_CODEBOOK_2BIT[4] = {
-    -0.133041590561f, -0.039991612341f, 0.039991612341f, 0.133041590561f,
+// ==== head_dim = 256 (seed 42) ====
+static __constant__ float TQ_SGN_256[256] = {
+     1,-1,-1, 1,-1, 1,-1, 1,-1, 1,-1,-1,-1, 1, 1, 1,
+     1,-1,-1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1, 1, 1,
+     1, 1, 1, 1,-1, 1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1,
+    -1,-1, 1,-1, 1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 1,
+    -1,-1, 1,-1, 1, 1, 1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1,-1,-1, 1,-1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1,-1,
+     1, 1, 1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1,-1,-1, 1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,-1,
+    -1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1, 1,
+    -1,-1,-1, 1, 1,-1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,
+    -1, 1, 1, 1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,-1,
+    -1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1, 1,-1,
+     1, 1,-1, 1, 1,-1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1,
+    -1,-1, 1, 1,-1,-1, 1, 1, 1, 1, 1, 1,-1,-1,-1, 1,
+    -1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1,-1,-1,-1,
+};
+static __constant__ float TQ_CB3_256[8] = {
+    -0.133854493499f,-0.083765551448f,-0.047166757286f,-0.015297502279f,
+    0.015297502279f,0.047166757286f,0.083765551448f,0.133854493499f,
+};
+static __constant__ float TQ_BD3_256[9] = {
+    -1.000000000000f,-0.108810022473f,-0.065466158092f,-0.031232129782f,
+    0.000000000000f,0.031232129782f,0.065466158092f,0.108810022473f,
+    1.000000000000f,
+};
+static __constant__ float TQ_CB4_256[16] = {
+    -0.169410735369f,-0.128588363528f,-0.100698113441f,-0.078249387443f,
+    -0.058732159436f,-0.040949229151f,-0.024200897664f,-0.008008380421f,
+    0.008008380421f,0.024200897664f,0.040949229151f,0.058732159436f,
+    0.078249387443f,0.100698113441f,0.128588363528f,0.169410735369f,
+};
+static __constant__ float TQ_BD4_256[17] = {
+    -1.000000000000f,-0.148999556899f,-0.114643231034f,-0.089473746717f,
+    -0.068490773439f,-0.049840692431f,-0.032575063407f,-0.016104638577f,
+    0.000000000000f,0.016104638577f,0.032575063407f,0.049840692431f,
+    0.068490773439f,0.089473746717f,0.114643231034f,0.148999556899f,
+    1.000000000000f,
 };
 
-// Sign array for WHT rotation (seed=42, dim=128)
-__constant__ float TQ_SIGNS_128[128] = {
-    -1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1,
-    -1,  1, -1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1, -1,
-    -1, -1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
-    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,
-    -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,
-     1,  1,  1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1,  1,  1, -1, -1, -1,
-    -1, -1, -1, -1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, -1,
+// ==== head_dim = 512 (seed 42) ====
+static __constant__ float TQ_SGN_512[512] = {
+     1,-1,-1, 1, 1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1, 1,
+    -1, 1, 1,-1,-1,-1,-1, 1, 1,-1,-1,-1,-1,-1,-1, 1,
+    -1,-1,-1, 1,-1, 1,-1, 1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1, 1,-1, 1,-1,
+     1, 1,-1, 1, 1, 1, 1, 1,-1, 1, 1, 1,-1, 1, 1,-1,
+    -1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,-1, 1,-1,
+     1, 1,-1,-1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1,-1,-1,
+     1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1,-1,-1,-1,
+    -1, 1,-1,-1, 1, 1, 1,-1,-1, 1,-1,-1, 1, 1, 1, 1,
+    -1,-1, 1, 1, 1, 1, 1,-1,-1, 1,-1,-1, 1,-1, 1,-1,
+     1,-1,-1, 1,-1, 1,-1,-1, 1,-1, 1,-1,-1, 1,-1, 1,
+     1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,-1,-1, 1,-1, 1,
+    -1, 1, 1,-1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,
+    -1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1,
+     1, 1, 1, 1,-1,-1,-1,-1, 1, 1, 1,-1,-1,-1,-1, 1,
+     1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1, 1, 1, 1, 1, 1,
+    -1,-1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1,-1,-1,
+     1, 1,-1, 1, 1,-1,-1, 1, 1,-1, 1,-1,-1, 1, 1, 1,
+     1,-1,-1, 1, 1, 1, 1,-1,-1, 1,-1,-1,-1, 1,-1, 1,
+     1, 1,-1,-1, 1, 1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1,
+     1,-1, 1, 1,-1, 1, 1,-1,-1, 1, 1, 1, 1,-1, 1, 1,
+     1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1, 1, 1,
+    -1, 1,-1,-1, 1,-1, 1,-1,-1,-1, 1, 1, 1,-1, 1, 1,
+    -1, 1, 1,-1, 1,-1,-1,-1,-1, 1, 1, 1,-1, 1, 1,-1,
+     1, 1, 1, 1,-1, 1, 1, 1,-1, 1, 1, 1,-1, 1,-1,-1,
+    -1,-1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,-1, 1,-1, 1,
+     1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1, 1, 1, 1, 1,-1,
+     1,-1, 1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1,-1,-1, 1,
+     1,-1, 1,-1, 1,-1, 1, 1,-1,-1,-1, 1,-1, 1, 1, 1,
+    -1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1, 1, 1,
+     1,-1, 1, 1,-1, 1, 1, 1,-1,-1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1,-1, 1,-1,-1,-1, 1,-1, 1,-1,-1, 1, 1,-1,
+};
+static __constant__ float TQ_CB3_512[8] = {
+    -0.094875931740f,-0.059311967343f,-0.033381462097f,-0.010824348778f,
+    0.010824348778f,0.033381462097f,0.059311967343f,0.094875931740f,
+};
+static __constant__ float TQ_BD3_512[9] = {
+    -1.000000000000f,-0.077093951404f,-0.046346712857f,-0.022102905437f,
+    -0.000000000000f,0.022102905437f,0.046346712857f,0.077093951404f,
+    1.000000000000f,
+};
+static __constant__ float TQ_CB4_512[16] = {
+    -0.120276063681f,-0.091181337833f,-0.071355909109f,-0.055424209684f,
+    -0.041587848216f,-0.028990162537f,-0.017131028697f,-0.005668541417f,
+    0.005668541417f,0.017131028697f,0.028990162537f,0.041587848216f,
+    0.055424209684f,0.071355909109f,0.091181337833f,0.120276063681f,
+};
+static __constant__ float TQ_BD4_512[17] = {
+    -1.000000000000f,-0.105728700757f,-0.081268623471f,-0.063390061259f,
+    -0.048506028950f,-0.035289004445f,-0.023060595617f,-0.011399785057f,
+    -0.000000000000f,0.011399785057f,0.023060595617f,0.035289004445f,
+    0.048506028950f,0.063390061259f,0.081268623471f,0.105728700757f,
+    1.000000000000f,
 };
 
-// ============================================================================
-// WHT in shared memory (for query rotation)
-// ============================================================================
 
-__device__ void tq_wht_butterfly_128(float* data, int tid) {
-    for (int h = 1; h < 128; h *= 2) {
+// ---------------------------------------------------------------------------
+// Table selection by head dimension
+// ---------------------------------------------------------------------------
+// `if constexpr` chains rather than a class template: __constant__ arrays decay
+// to __constant__-space pointers, so this compiles to a compile-time address
+// with no indirection at run time.
+
+template <int HS>
+__device__ __forceinline__ const float* tq_signs() {
+    if constexpr (HS == 64) return TQ_SGN_64;
+    else if constexpr (HS == 128) return TQ_SGN_128;
+    else if constexpr (HS == 256) return TQ_SGN_256;
+    else return TQ_SGN_512;
+}
+
+template <int HS>
+__device__ __forceinline__ const float* tq_cb4() {
+    if constexpr (HS == 64) return TQ_CB4_64;
+    else if constexpr (HS == 128) return TQ_CB4_128;
+    else if constexpr (HS == 256) return TQ_CB4_256;
+    else return TQ_CB4_512;
+}
+
+template <int HS>
+__device__ __forceinline__ const float* tq_cb3() {
+    if constexpr (HS == 64) return TQ_CB3_64;
+    else if constexpr (HS == 128) return TQ_CB3_128;
+    else if constexpr (HS == 256) return TQ_CB3_256;
+    else return TQ_CB3_512;
+}
+
+template <int HS>
+__device__ __forceinline__ const float* tq_bd4() {
+    if constexpr (HS == 64) return TQ_BD4_64;
+    else if constexpr (HS == 128) return TQ_BD4_128;
+    else if constexpr (HS == 256) return TQ_BD4_256;
+    else return TQ_BD4_512;
+}
+
+template <int HS>
+__device__ __forceinline__ const float* tq_bd3() {
+    if constexpr (HS == 64) return TQ_BD3_64;
+    else if constexpr (HS == 128) return TQ_BD3_128;
+    else if constexpr (HS == 256) return TQ_BD3_256;
+    else return TQ_BD3_512;
+}
+
+/// 1/sqrt(HS) — the normalisation that makes the Hadamard transform, and
+/// therefore all of D·H·D, its own inverse. A plain constant expression rather
+/// than a constexpr function so it needs no relaxed-constexpr support.
+#define TQ_WHT_SCALE(HS) ((HS) == 64    ? 0.125f                \
+                        : (HS) == 128   ? 0.08838834764831845f  \
+                        : (HS) == 256   ? 0.0625f               \
+                        : 0.04419417382415922f)
+
+// ---------------------------------------------------------------------------
+// Rotation
+// ---------------------------------------------------------------------------
+
+/// In-place D·H·D over `HS` contiguous floats in shared memory, cooperatively
+/// across `NT` threads.
+///
+/// Self-inverse, so the same call rotates a query forward and rotates the V
+/// accumulator back. The butterfly and the 1/sqrt(HS) scaling are ordered to
+/// match `turboquant::wht::fwht_inplace` exactly (all butterflies, then one
+/// scale) — reordering them would still be orthogonal but would no longer
+/// agree with the cache written by the Rust compressor.
+///
+/// At HS == NT == 128 this emits the same sequence of operations the original
+/// hand-written `rotate128` did.
+template <int HS, int NT>
+__device__ __forceinline__ void tq_rotate(float* d, int tid) {
+    const float* sgn = tq_signs<HS>();
+
+    for (int i = tid; i < HS; i += NT) d[i] *= sgn[i];
+    __syncthreads();
+
+    for (int h = 1; h < HS; h *= 2) {
         __syncthreads();
-        for (int idx = tid; idx < 64; idx += 128) {
-            int block_start = (idx / h) * (h * 2);
-            int offset = idx % h;
-            int i = block_start + offset;
-            int j = i + h;
-            float a = data[i];
-            float b = data[j];
-            data[i] = a + b;
-            data[j] = a - b;
+        for (int i = tid; i < HS / 2; i += NT) {
+            const int bs = (i / h) * (h * 2), off = i % h;
+            const float a = d[bs + off], b = d[bs + off + h];
+            d[bs + off] = a + b;
+            d[bs + off + h] = a - b;
         }
     }
+    __syncthreads();
+
+    constexpr float s = TQ_WHT_SCALE(HS);
+    for (int i = tid; i < HS; i += NT) d[i] *= s;
+    __syncthreads();
+
+    for (int i = tid; i < HS; i += NT) d[i] *= sgn[i];
     __syncthreads();
 }
 
-// Apply D·H·D rotation to a 128-dim vector in shared memory
-__device__ void tq_rotate_128(float* data, int tid) {
-    // D · x
-    if (tid < 128) data[tid] *= TQ_SIGNS_128[tid];
-    __syncthreads();
-    // H · D · x
-    tq_wht_butterfly_128(data, tid);
-    // Scale by 1/sqrt(128)
-    if (tid < 128) data[tid] *= 0.08838834764831845f;
-    __syncthreads();
-    // D · H · D · x
-    if (tid < 128) data[tid] *= TQ_SIGNS_128[tid];
-    __syncthreads();
+// ---------------------------------------------------------------------------
+// Scalar quantizers
+// ---------------------------------------------------------------------------
+// Binary search over the codebook's decision boundaries. `boundaries[0]` and
+// `boundaries[n]` are the sentinels -1 and +1, so a unit-sphere coordinate can
+// never fall outside.
+
+template <int HS>
+__device__ __forceinline__ uint8_t tq_q4(float x) {
+    const float* bd = tq_bd4<HS>();
+    if (x <= bd[1]) return 0;
+    if (x >= bd[16]) return 15;
+    int lo = 1, hi = 16;
+    while (lo < hi) { const int m = (lo + hi) >> 1; if (x < bd[m]) hi = m; else lo = m + 1; }
+    return (uint8_t)(lo - 1);
 }
 
-// ============================================================================
-// TurboQuant Paged Attention Kernel (simplified, HEAD_SIZE=128)
-// ============================================================================
-
-/**
- * Simplified TurboQuant attention for decode (single query token).
- *
- * This kernel processes one sequence per block, one head per block.
- * It computes attention over compressed KV cache using codebook lookups.
- *
- * Parameters:
- *   out:          [num_seqs, num_heads, HEAD_SIZE] output
- *   q:            [num_seqs, num_heads, HEAD_SIZE] query (not rotated)
- *   k_packed:     [total_tokens, num_kv_heads, k_packed_bytes] packed 4-bit K indices
- *   v_packed:     [total_tokens, num_kv_heads, v_packed_bytes] packed 3-bit V indices
- *   k_norms:      [total_tokens, num_kv_heads] half norms for K
- *   v_norms:      [total_tokens, num_kv_heads] half norms for V
- *   token_table:  [num_seqs, max_context_len] maps (seq, pos) → token index
- *   context_lens: [num_seqs] actual context length per sequence
- *
- * Grid:  (num_heads, num_seqs, 1)
- * Block: (128, 1, 1)
- */
-template <int HEAD_SIZE, int K_BITS, int V_BITS>
-__global__ void turbo_paged_attention_kernel(
-    float*       __restrict__ out,           // [num_seqs, num_heads, HEAD_SIZE]
-    const float* __restrict__ q,             // [num_seqs, num_heads, HEAD_SIZE]
-    const uint8_t* __restrict__ k_packed,    // [total_tokens, num_kv_heads, k_bytes_per_head]
-    const uint8_t* __restrict__ v_packed,    // [total_tokens, num_kv_heads, v_bytes_per_head]
-    const __half*  __restrict__ k_norms,     // [total_tokens, num_kv_heads]
-    const __half*  __restrict__ v_norms,     // [total_tokens, num_kv_heads]
-    const int32_t* __restrict__ token_table, // [num_seqs, max_tokens_per_seq]
-    const int32_t* __restrict__ context_lens,// [num_seqs]
-    const int num_kv_heads,
-    const int max_tokens_per_seq,
-    const int num_heads,
-    const float scale
-) {
-    static_assert(HEAD_SIZE == 128, "TurboQuant currently supports HEAD_SIZE=128 only");
-
-    const int head_idx = blockIdx.x;
-    const int seq_idx = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int context_len = context_lens[seq_idx];
-
-    if (context_len == 0) return;
-
-    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
-
-    // Packed sizes per head
-    constexpr int K_BYTES = (K_BITS == 4) ? (HEAD_SIZE / 2) :
-                            (K_BITS == 3) ? (((HEAD_SIZE + 9) / 10) * 4) :
-                            (HEAD_SIZE / 4);
-    constexpr int V_BYTES = (V_BITS == 4) ? (HEAD_SIZE / 2) :
-                            (V_BITS == 3) ? (((HEAD_SIZE + 9) / 10) * 4) :
-                            (HEAD_SIZE / 4);
-
-    // Select codebooks
-    const float* k_codebook = (K_BITS == 4) ? TQ_CODEBOOK_4BIT :
-                              (K_BITS == 3) ? TQ_CODEBOOK_3BIT :
-                              TQ_CODEBOOK_2BIT;
-    const float* v_codebook = (V_BITS == 4) ? TQ_CODEBOOK_4BIT :
-                              (V_BITS == 3) ? TQ_CODEBOOK_3BIT :
-                              TQ_CODEBOOK_2BIT;
-
-    // =========================================================
-    // Step 1: Load and rotate query
-    // =========================================================
-    __shared__ float q_rotated[128];
-    const float* q_ptr = q + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-    if (tid < HEAD_SIZE) {
-        q_rotated[tid] = q_ptr[tid];
-    }
-    __syncthreads();
-
-    // Apply D·H·D rotation to the query
-    tq_rotate_128(q_rotated, tid);
-
-    // =========================================================
-    // Step 2: Compute Q·K attention scores
-    // =========================================================
-    // We process one token at a time. Each thread handles one dimension.
-    // This is simpler than the vectorized paged attention but correct.
-
-    extern __shared__ char shared_mem[];
-    float* logits = reinterpret_cast<float*>(shared_mem);
-    float* reduce_buf = reinterpret_cast<float*>(shared_mem + context_len * sizeof(float));
-
-    float qk_max = -FLT_MAX;
-
-    for (int t = 0; t < context_len; t++) {
-        int token_idx = token_table[seq_idx * max_tokens_per_seq + t];
-        const uint8_t* k_ptr = k_packed + (token_idx * num_kv_heads + kv_head_idx) * K_BYTES;
-        float k_norm = __half2float(k_norms[token_idx * num_kv_heads + kv_head_idx]);
-
-        // Each thread loads and dequantizes one element of the key
-        float k_val = 0.0f;
-        if (tid < HEAD_SIZE) {
-            uint8_t idx;
-            if constexpr (K_BITS == 4) {
-                // Nibble packing: 2 per byte
-                uint8_t byte = k_ptr[tid / 2];
-                idx = (tid & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
-            } else if constexpr (K_BITS == 3) {
-                // 10-in-32 packing
-                int group = tid / 10;
-                int pos_in_group = tid % 10;
-                uint32_t word = *reinterpret_cast<const uint32_t*>(k_ptr + group * 4);
-                idx = (word >> (pos_in_group * 3)) & 0x7;
-            } else {
-                // 2-bit: 4 per byte
-                uint8_t byte = k_ptr[tid / 4];
-                int shift = 6 - (tid % 4) * 2;
-                idx = (byte >> shift) & 0x3;
-            }
-            k_val = k_codebook[idx];
-        }
-
-        // Dot product: q_rotated · k_centroids (all in rotated domain)
-        // Parallel reduction across 128 threads
-        float partial = (tid < HEAD_SIZE) ? q_rotated[tid] * k_val : 0.0f;
-
-        // Warp-level reduction
-        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-            partial += __shfl_xor_sync(0xffffffff, partial, mask);
-        }
-
-        // Cross-warp reduction via shared memory
-        __shared__ float warp_sums[4]; // 128 threads / 32 = 4 warps
-        if (tid % WARP_SIZE == 0) {
-            warp_sums[tid / WARP_SIZE] = partial;
-        }
-        __syncthreads();
-
-        float qk = 0.0f;
-        if (tid == 0) {
-            for (int w = 0; w < 4; w++) qk += warp_sums[w];
-            qk = qk * k_norm * scale;
-            logits[t] = qk;
-            qk_max = fmaxf(qk_max, qk);
-        }
-        __syncthreads();
-    }
-
-    // Broadcast qk_max to all threads
-    if (tid == 0) {
-        reduce_buf[0] = qk_max;
-    }
-    __syncthreads();
-    qk_max = reduce_buf[0];
-
-    // =========================================================
-    // Step 3: Softmax
-    // =========================================================
-    float exp_sum = 0.0f;
-    for (int t = tid; t < context_len; t += blockDim.x) {
-        float val = __expf(logits[t] - qk_max);
-        logits[t] = val;
-        exp_sum += val;
-    }
-    // Reduce exp_sum across threads
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        exp_sum += __shfl_xor_sync(0xffffffff, exp_sum, mask);
-    }
-    __shared__ float warp_exp_sums[4];
-    if (tid % WARP_SIZE == 0) {
-        warp_exp_sums[tid / WARP_SIZE] = exp_sum;
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int w = 0; w < 4; w++) total += warp_exp_sums[w];
-        reduce_buf[0] = __fdividef(1.0f, total + 1e-6f);
-    }
-    __syncthreads();
-    float inv_sum = reduce_buf[0];
-
-    for (int t = tid; t < context_len; t += blockDim.x) {
-        logits[t] *= inv_sum;
-    }
-    __syncthreads();
-
-    // =========================================================
-    // Step 4: Weighted sum of values (attention · V)
-    // =========================================================
-    // Each thread accumulates its dimension across all tokens
-    float acc = 0.0f;
-
-    if (tid < HEAD_SIZE) {
-        for (int t = 0; t < context_len; t++) {
-            float weight = logits[t];
-            if (weight < 1e-8f) continue; // Skip near-zero weights
-
-            int token_idx = token_table[seq_idx * max_tokens_per_seq + t];
-            const uint8_t* v_ptr = v_packed + (token_idx * num_kv_heads + kv_head_idx) * V_BYTES;
-            float v_norm = __half2float(v_norms[token_idx * num_kv_heads + kv_head_idx]);
-
-            // Dequantize value element
-            uint8_t idx;
-            if constexpr (V_BITS == 4) {
-                uint8_t byte = v_ptr[tid / 2];
-                idx = (tid & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
-            } else if constexpr (V_BITS == 3) {
-                int group = tid / 10;
-                int pos_in_group = tid % 10;
-                uint32_t word = *reinterpret_cast<const uint32_t*>(v_ptr + group * 4);
-                idx = (word >> (pos_in_group * 3)) & 0x7;
-            } else {
-                uint8_t byte = v_ptr[tid / 4];
-                int shift = 6 - (tid % 4) * 2;
-                idx = (byte >> shift) & 0x3;
-            }
-
-            float v_val = v_codebook[idx] * v_norm;
-            acc += weight * v_val;
-        }
-    }
-
-    // =========================================================
-    // Step 5: Inverse rotation and write output
-    // =========================================================
-    // V was compressed in the rotated domain, so the accumulated output
-    // is also in the rotated domain. Apply inverse rotation.
-    __shared__ float out_rotated[128];
-    if (tid < HEAD_SIZE) {
-        out_rotated[tid] = acc;
-    }
-    __syncthreads();
-
-    // D·H·D is self-inverse
-    tq_rotate_128(out_rotated, tid);
-
-    // Write output
-    float* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-    if (tid < HEAD_SIZE) {
-        out_ptr[tid] = out_rotated[tid];
-    }
+template <int HS>
+__device__ __forceinline__ uint8_t tq_q3(float x) {
+    const float* bd = tq_bd3<HS>();
+    if (x <= bd[1]) return 0;
+    if (x >= bd[8]) return 7;
+    int lo = 1, hi = 8;
+    while (lo < hi) { const int m = (lo + hi) >> 1; if (x < bd[m]) hi = m; else lo = m + 1; }
+    return (uint8_t)(lo - 1);
 }
 
-// ============================================================================
-// Launch wrapper
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Packed-K gather
+// ---------------------------------------------------------------------------
 
-inline void launch_turbo_paged_attention(
-    float* out,
-    const float* q,
-    const uint8_t* k_packed,
-    const uint8_t* v_packed,
-    const __half* k_norms,
-    const __half* v_norms,
-    const int32_t* token_table,
-    const int32_t* context_lens,
-    int num_kv_heads,
-    int max_tokens_per_seq,
-    int num_seqs,
-    int num_heads,
-    int head_size,
-    float scale,
-    int k_bits,
-    int v_bits,
-    cudaStream_t stream
-) {
-    // Shared memory: context_len * sizeof(float) for logits + scratch
-    // Use max_tokens_per_seq as upper bound
-    int shared_mem_size = (max_tokens_per_seq + 1) * sizeof(float);
+/// Bytes of packed 4-bit K each lane owns: (HS/2 bytes per head) / 32 lanes.
+/// 1 at HS=64, 2 at 128, 4 at 256, 8 at 512.
+#define TQ_BYTES_PER_LANE(HS) ((HS) / 64)
 
-    dim3 grid(num_heads, num_seqs, 1);
-    dim3 block(128); // One thread per head dimension
-
-    // Dispatch based on bit-width combination
-    if (head_size == 128) {
-        if (k_bits == 4 && v_bits == 3) {
-            turbo_paged_attention_kernel<128, 4, 3><<<grid, block, shared_mem_size, stream>>>(
-                out, q, k_packed, v_packed, k_norms, v_norms,
-                token_table, context_lens, num_kv_heads, max_tokens_per_seq,
-                num_heads, scale);
-        } else if (k_bits == 3 && v_bits == 3) {
-            turbo_paged_attention_kernel<128, 3, 3><<<grid, block, shared_mem_size, stream>>>(
-                out, q, k_packed, v_packed, k_norms, v_norms,
-                token_table, context_lens, num_kv_heads, max_tokens_per_seq,
-                num_heads, scale);
-        } else if (k_bits == 3 && v_bits == 2) {
-            turbo_paged_attention_kernel<128, 3, 2><<<grid, block, shared_mem_size, stream>>>(
-                out, q, k_packed, v_packed, k_norms, v_norms,
-                token_table, context_lens, num_kv_heads, max_tokens_per_seq,
-                num_heads, scale);
-        }
+/// Load a lane's whole packed-K run as one vector access.
+///
+/// The run is contiguous and naturally aligned: the cache's x=16 swizzle keeps
+/// each group of 16 bytes contiguous, and a lane's run starts at `lane*BPL`
+/// with BPL a power of two dividing 16, so it never straddles a group.
+template <int BPL>
+__device__ __forceinline__ uint64_t tq_load_klane(const uint8_t* p) {
+    if constexpr (BPL == 1) {
+        return (uint64_t)(*p);
+    } else if constexpr (BPL == 2) {
+        return (uint64_t)(*reinterpret_cast<const uint16_t*>(p));
+    } else if constexpr (BPL == 4) {
+        return (uint64_t)(*reinterpret_cast<const uint32_t*>(p));
+    } else {
+        const uint2 v = *reinterpret_cast<const uint2*>(p);
+        return ((uint64_t)v.y << 32) | (uint64_t)v.x;
     }
 }
