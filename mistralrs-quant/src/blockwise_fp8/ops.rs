@@ -925,6 +925,133 @@ fn fp8_gemv_max_m() -> usize {
     *MAX_M
 }
 
+/// Parent system: ArcKernels.
+///
+/// Kill switch for the tensor-core blockwise-FP8 GEMM
+/// (`kernels/blockwise_fp8/blockwise_fp8_gemm_wmma.cu`).
+///
+/// # 🔴 UNVERIFIED ON HARDWARE — never run
+///
+/// The WMMA kernel has never executed. It is nonetheless the DEFAULT, per the
+/// house fast-path-default policy, so that the first box to run this binary
+/// A/Bs it against the scalar kernel without a rebuild:
+///
+/// ```text
+///   (default)                -> tensor-core WMMA GEMM
+///   ARC_NO_FP8_WMMA=1        -> the shipped scalar `fp8_matmul_tiled`
+/// ```
+///
+/// Set `ARC_NO_FP8_WMMA=1` to get back exactly the behaviour of the commit
+/// before this one. That is the control arm; run it first.
+///
+/// # ⚠️ THIS KERNEL IS UNREACHABLE IF `ARC_FP8_CUBLAS_MIN_M` IS LOWERED
+///
+/// `BlockwiseFP8Linear::forward` decides between *this whole file* and the
+/// dequantize + cuBLASLt fallback **before** it ever gets here:
+///
+/// ```text
+///   m_rows >= arc_fp8_cublas_min_m()  ->  dequantize_w() + cuBLASLt
+///   otherwise                         ->  the native FP8 path (this file)
+/// ```
+///
+/// On master that constant is 512, so B = 256 reaches this kernel. A separate
+/// change in flight (PR #201) lowers it to **5**, which routes everything
+/// above the GEMV domain into the dequantize path and leaves this kernel
+/// **dead code at every batch size that matters**. That is the exact
+/// "wired-but-dead" failure this repo already tracks, and it would be silent:
+/// the kernel compiles, the tests pass, and it never runs.
+///
+/// The two changes are not actually in conflict — they are answers to the
+/// *same* question asked before and after the premise changed. The reason
+/// cuBLASLt won the M = 8..128 sweep is that it had tensor cores and the
+/// native FP8 path did not. This kernel removes that asymmetry, and it does
+/// so while reading FP8 straight from HBM: no `dequantize_w()`, so none of
+/// the ~12.7 GB/step of dequantize traffic and none of the +8.48 GB of
+/// resident BF16 weights that the cuBLASLt arm pays for.
+///
+/// So whoever merges these two must **re-run the threshold sweep with this
+/// kernel present**, comparing three arms, not two:
+///
+/// ```text
+///   (a) dequantize_w() + cuBLASLt          <- what PR #201 measured
+///   (b) native FP8 tensor-core GEMM        <- this file, ARC_NO_FP8_WMMA unset
+///   (c) native scalar fp8_matmul_tiled     <- ARC_NO_FP8_WMMA=1
+/// ```
+///
+/// Derivation, NOT a measurement: (b) should beat (a) because it moves
+/// ~4.238 GB instead of ~12.7 GB and skips a full-model dequantize per step.
+/// Nobody has run it. Do not merge a threshold on the two-arm result.
+///
+/// # Why there is no M threshold here
+///
+/// There is an obvious temptation to gate this on some minimum M, since a
+/// 64-row block tile is mostly empty at M = 8. Two reasons not to, and the
+/// second is the important one:
+///
+/// 1. In that regime the kernel is bound by streaming the weight tile, not by
+///    the MMA issue rate, so an under-filled M tile costs far less than the
+///    ~100x per-useful-FLOP penalty of staying on the scalar kernel.
+/// 2. **This codebase has now frozen a dispatch threshold from a single
+///    measured point twice** — `ARC_FP8_CUBLAS_MIN_M = 512` (512 was the only
+///    M ever measured, and M = 5..511 fell through to the scalar kernel as a
+///    result) and `qtip::gather_policy`'s `n >= 683` tile-fill predicate. A
+///    threshold is a claim about every value it excludes. I have **zero**
+///    measured points, so inventing one here would be strictly worse than
+///    those two were. Sweep it on hardware, then add a threshold if the sweep
+///    shows one — with the clean rows written down.
+#[cfg(feature = "cuda")]
+fn fp8_wmma_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("ARC_NO_FP8_WMMA").is_err());
+    *ENABLED
+}
+
+/// Block tiling the WMMA kernel was actually compiled with, read from the
+/// kernel itself rather than duplicated here.
+///
+/// The eligibility test below is a statement about that tiling: it is what
+/// guarantees the `[N/bs_y, K/bs_x]` block scale is a single scalar over each
+/// tile, which is the kernel's entire premise. Duplicating `64` and `128` in
+/// Rust would let the two drift silently the day someone retunes the kernel,
+/// and the failure mode of that drift is a *numerically wrong* GEMM, not a
+/// crash — so the numbers are exported from the `.cu` and read once.
+#[cfg(feature = "cuda")]
+fn fp8_wmma_tile_dims() -> (i32, i32, i32) {
+    use std::sync::LazyLock;
+    static DIMS: LazyLock<(i32, i32, i32)> = LazyLock::new(|| {
+        let (mut m, mut n, mut k) = (0i32, 0i32, 0i32);
+        // Pure host function; writes three ints. Linked from either
+        // blockwise_fp8_gemm_wmma.cu or its `_dummy` stub.
+        unsafe { crate::blockwise_fp8::ffi::fp8_matmul_wmma_tile_dims(&mut m, &mut n, &mut k) };
+        (m, n, k)
+    });
+    *DIMS
+}
+
+/// Whether a given blockwise-FP8 scale geometry is one the WMMA kernel can
+/// serve correctly.
+///
+/// The kernel applies one f32 scale to the whole `N_BLK x K_BLK` accumulator
+/// tile per K step. That is only correct when a tile cannot straddle two
+/// scale blocks:
+///
+/// * `block_size_x % K_BLK == 0` — a K tile lies inside one scale column.
+/// * `block_size_y % N_BLK == 0` — an N tile lies inside one scale row (N
+///   tiles are `N_BLK`-aligned, so divisibility is sufficient).
+///
+/// For the usual DeepSeek-style `[128, 128]` geometry, with `N_BLK = 64` and
+/// `K_BLK = 128`, both hold. Anything else falls back to the scalar kernel,
+/// which reads the scale per element and so has no such constraint. M, N and
+/// K themselves are unconstrained — the kernel zero-fills ragged edges.
+#[cfg(feature = "cuda")]
+fn fp8_wmma_eligible(block_size_y: i32, block_size_x: i32) -> bool {
+    let (_m_blk, n_blk, k_blk) = fp8_wmma_tile_dims();
+    if n_blk <= 0 || k_blk <= 0 {
+        return false;
+    }
+    block_size_y % n_blk == 0 && block_size_x % k_blk == 0
+}
+
 /// FP8 blockwise matmul.
 /// Computes output = input @ weight.T where weight is FP8 blockwise quantized.
 /// - input: [M, K] in fp16/bf16
@@ -1012,6 +1139,19 @@ fn fp8_blockwise_matmul_impl(
     let gemv_aligned = k % 4 == 0 && block_size_x % 4 == 0;
     let use_gemv = force_gemv.unwrap_or_else(|| (m as usize) <= fp8_gemv_max_m()) && gemv_aligned;
 
+    // Tensor-core GEMM for everything the GEMV does not own.
+    //
+    // 🔴 UNVERIFIED ON HARDWARE — never run. Default-on so the first box can
+    // A/B it in one binary; `ARC_NO_FP8_WMMA=1` restores the scalar kernel.
+    //
+    // `force_gemv` keeps its documented meaning: an explicit `Some(false)`
+    // still selects the *scalar* tiled GEMM, so any test that pins that path
+    // keeps testing it.
+    let use_wmma = !use_gemv
+        && force_gemv.is_none()
+        && fp8_wmma_enabled()
+        && fp8_wmma_eligible(block_size_y, block_size_x);
+
     let input_l = input.layout();
     let weight_l = weight.layout();
     let scales_l = scales.layout();
@@ -1049,6 +1189,23 @@ fn fp8_blockwise_matmul_impl(
                 if use_gemv {
                     unsafe {
                         ffi::launch_fp8_gemv_f16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            block_size_x,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                } else if use_wmma {
+                    // UNVERIFIED ON HARDWARE — never run.
+                    unsafe {
+                        ffi::launch_fp8_matmul_wmma_f16(
                             input_ptr as *const _,
                             weight_ptr as *const _,
                             scales_ptr as *const _,
@@ -1103,6 +1260,23 @@ fn fp8_blockwise_matmul_impl(
                 if use_gemv {
                     unsafe {
                         ffi::launch_fp8_gemv_bf16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            block_size_x,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                } else if use_wmma {
+                    // UNVERIFIED ON HARDWARE — never run.
+                    unsafe {
+                        ffi::launch_fp8_matmul_wmma_bf16(
                             input_ptr as *const _,
                             weight_ptr as *const _,
                             scales_ptr as *const _,
