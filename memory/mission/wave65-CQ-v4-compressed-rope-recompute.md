@@ -43,8 +43,10 @@ the rolling compressor only ever *appends*, and only appends once every `ratio`
 tokens.
 
 The one thing already memoized here is the position vector itself
-(`compressed_row_positions`, `deepseek4.rs:3013-3037`) — the thread-local there
-is the pattern the rest of this wants.
+(`compress_positions`, `layers.rs:2391-2459`) — the thread-local there is the
+pattern the rest of this wants. Note it is keyed per `(ratio, device)`, NOT per
+`(t_c, ratio, device)`: V4 interleaves CSA (ratio 4) and HCA (ratio 128) layers,
+so a single-slot cache is evicted by the very next layer and memoizes nothing.
 
 ---
 
@@ -80,8 +82,10 @@ did not change.
    rotates 0 or 1 new rows and concatenates, instead of rotating `t_c`.
 2. The `cos`/`sin` gathers are **separately memoizable** — they depend only on
    `(t_c, ratio, device)`, exactly like the already-memoized
-   `compressed_row_positions` (`deepseek4.rs:3013-3037`) and `GRAPH_BLOCK_IDS`
-   (`dsv4_attention.rs`). Those two are the established in-tree pattern to copy.
+   `compress_positions` (`layers.rs:2391-2459`) and `GRAPH_BLOCK_IDS`
+   (`dsv4_attention.rs`). Those two are the established in-tree pattern to copy —
+   and copy the KEY as well as the shape: one slot per `(ratio, device)`, so the
+   CSA/HCA interleave cannot thrash it.
 
 Item 2 is independent of item 1 and much cheaper to land; it is worth doing first.
 
