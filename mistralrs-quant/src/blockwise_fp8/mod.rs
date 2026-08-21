@@ -95,6 +95,20 @@ impl QuantMethod for BlockwiseFP8Linear {
             // A/B runs from a single binary.
             let m_rows: usize = x.dims().iter().rev().skip(1).product();
             let prefer_cublas = m_rows >= arc_fp8_cublas_min_m();
+            if prefer_cublas
+                && matches!(x.device(), candle_core::Device::Cuda(_))
+                && ffi::HAVE_BLOCKWISE_GEMM_KERNELS
+            {
+                // Engagement line for the threshold sweep: this forward was
+                // DIVERTED from the native FP8 kernels to dequantize+cuBLASLt
+                // by `ARC_FP8_CUBLAS_MIN_M`. `ARC_LOG_FP8_DISPATCH=1` only.
+                ops::log_fp8_dispatch(
+                    ops::Fp8DispatchPath::DequantCublaslt,
+                    m_rows,
+                    self.weight.dims().first().copied().unwrap_or(0),
+                    x.dims().last().copied().unwrap_or(0),
+                );
+            }
             if !prefer_cublas
                 && matches!(x.device(), candle_core::Device::Cuda(_))
                 && ffi::HAVE_BLOCKWISE_GEMM_KERNELS

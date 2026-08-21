@@ -1008,8 +1008,7 @@ fn fp8_wmma_enabled() -> bool {
     // Under the presence test this replaced, it silently selected the control
     // arm — which is the arm this kernel's own docs tell you to run first, so
     // an operator following them would have recorded the control twice.
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| !crate::env_flag_is_set("ARC_NO_FP8_WMMA"));
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| !crate::env_flag_is_set("ARC_NO_FP8_WMMA"));
     *ENABLED
 }
 
@@ -1097,6 +1096,81 @@ fn wide_gemv_shift(
         weight_ptr as usize,
         input_ptr as usize,
     )
+}
+
+/// Parent system: ArcLab.
+///
+/// Which blockwise-FP8 kernel a forward actually selected. Used only by
+/// [`log_fp8_dispatch`]; the discriminants index its once-per-process latch.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub(crate) enum Fp8DispatchPath {
+    GemvWide = 0,
+    GemvWarp = 1,
+    Wmma = 2,
+    Tiled = 3,
+    DequantCublaslt = 4,
+}
+
+#[cfg(feature = "cuda")]
+impl Fp8DispatchPath {
+    fn name(self) -> &'static str {
+        match self {
+            Fp8DispatchPath::GemvWide => "gemv_wide",
+            Fp8DispatchPath::GemvWarp => "gemv_warp",
+            Fp8DispatchPath::Wmma => "wmma",
+            Fp8DispatchPath::Tiled => "tiled",
+            Fp8DispatchPath::DequantCublaslt => "dequant_cublaslt",
+        }
+    }
+}
+
+/// `ARC_LOG_FP8_DISPATCH=1` — engagement logging for the blockwise-FP8
+/// dispatch. Read by VALUE via `env_flag_is_set` (`=0` keeps it off), latched
+/// once per process so the decode hot loop never touches the env.
+///
+/// Registered in `mistralrs-core/tests/capability_reachability.rs`.
+#[cfg(feature = "cuda")]
+fn fp8_dispatch_log_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| crate::env_flag_is_set("ARC_LOG_FP8_DISPATCH"));
+    *ENABLED
+}
+
+/// Parent system: ArcLab.
+///
+/// Print ONE line per dispatch path per process naming the kernel that
+/// actually ran — the engagement assertion every threshold sweep must grep
+/// for. A sweep leg that cannot prove WHICH kernel served it is measuring an
+/// assumption (`ARC_NO_DEDICATED_DECODE` produced exactly that null result:
+/// both arms of two A/Bs ran the same code and nobody could tell).
+///
+/// Cost when `ARC_LOG_FP8_DISPATCH` is unset (the default): one latched bool
+/// read. When set: one relaxed atomic swap per call — no locks, no
+/// allocation — so enabling it does not perturb the rates the sweep records.
+/// The shape printed is the FIRST shape that reached the path, which is
+/// enough to identify the projection; per-call logging would be ~430 lines
+/// per V4 step at B=256 and is deliberately not offered.
+#[cfg(feature = "cuda")]
+pub(crate) fn log_fp8_dispatch(path: Fp8DispatchPath, m: usize, n: usize, k: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: [AtomicBool; 5] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    if !fp8_dispatch_log_enabled() {
+        return;
+    }
+    if !LOGGED[path as usize].swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[arc-fp8-dispatch] path={} first_shape=m{m}_n{n}_k{k}",
+            path.name()
+        );
+    }
 }
 
 /// FP8 blockwise matmul.
@@ -1221,8 +1295,7 @@ fn fp8_blockwise_matmul_impl(
 
     match input.dtype() {
         DType::F16 => {
-            let output =
-                crate::arc_outbuf::alloc_out_fully_written::<f16>(&dev, (m * n) as usize)?;
+            let output = crate::arc_outbuf::alloc_out_fully_written::<f16>(&dev, (m * n) as usize)?;
 
             let input_s = match &*input_storage {
                 Storage::Cuda(cuda_storage) => cuda_storage.as_cuda_slice::<f16>()?,
@@ -1234,6 +1307,21 @@ fn fp8_blockwise_matmul_impl(
                 let (input_ptr, _input_guard) = slice_ptr(input_s, input_l.start_offset());
 
                 let wide_shift = wide_gemv_shift(use_gemv, k, block_size_x, weight_ptr, input_ptr);
+                // Mirrors the if/else chain below exactly; keep the two in step.
+                log_fp8_dispatch(
+                    if wide_shift.is_some() {
+                        Fp8DispatchPath::GemvWide
+                    } else if use_gemv {
+                        Fp8DispatchPath::GemvWarp
+                    } else if use_wmma {
+                        Fp8DispatchPath::Wmma
+                    } else {
+                        Fp8DispatchPath::Tiled
+                    },
+                    m as usize,
+                    n as usize,
+                    k as usize,
+                );
                 if let Some(scale_shift) = wide_shift {
                     // 🔴 UNVERIFIED ON HARDWARE. `ARC_FP8_GEMV_WIDE=1` only.
                     unsafe {
@@ -1323,6 +1411,21 @@ fn fp8_blockwise_matmul_impl(
                 let (input_ptr, _input_guard) = slice_ptr(input_s, input_l.start_offset());
 
                 let wide_shift = wide_gemv_shift(use_gemv, k, block_size_x, weight_ptr, input_ptr);
+                // Mirrors the if/else chain below exactly; keep the two in step.
+                log_fp8_dispatch(
+                    if wide_shift.is_some() {
+                        Fp8DispatchPath::GemvWide
+                    } else if use_gemv {
+                        Fp8DispatchPath::GemvWarp
+                    } else if use_wmma {
+                        Fp8DispatchPath::Wmma
+                    } else {
+                        Fp8DispatchPath::Tiled
+                    },
+                    m as usize,
+                    n as usize,
+                    k as usize,
+                );
                 if let Some(scale_shift) = wide_shift {
                     // 🔴 UNVERIFIED ON HARDWARE. `ARC_FP8_GEMV_WIDE=1` only.
                     unsafe {
