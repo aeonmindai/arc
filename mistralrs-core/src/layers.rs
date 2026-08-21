@@ -2449,12 +2449,7 @@ pub fn compress_positions(t_c: usize, ratio: usize, device: &Device) -> Result<T
                 cache.retain(|(r, t)| !(*r == ratio && t.device().same_device(device)));
                 let cap = t_c.div_ceil(COMPRESS_POS_CHUNK) * COMPRESS_POS_CHUNK;
                 // The one `arange` — deliberately here and not in the forward.
-                let table = Tensor::arange_step(
-                    0u32,
-                    (cap * ratio) as u32,
-                    ratio as u32,
-                    device,
-                )?;
+                let table = Tensor::arange_step(0u32, (cap * ratio) as u32, ratio as u32, device)?;
                 cache.push((ratio, table));
                 cache.len() - 1
             }
@@ -2666,23 +2661,23 @@ pub fn set_graph_mode_mask(mask: Option<Tensor>) {
     GRAPH_MODE_MASK.with(|m| *m.borrow_mut() = mask);
 }
 
-/// Per-layer output handles, for bisecting a CUDA-graph replay against eager.
-///
-/// The same-step probe proved the recorded graph is wired correctly (max|Δ| =
-/// 0 on the capture step), so a divergence one step later is a per-step input
-/// that must advance and does not. This finds WHICH one by finding the first
-/// layer whose output differs.
-///
-/// The mechanism relies on a property of capture: the tensors a captured
-/// forward produces are ordinary warm-pool buffers, and the recorded kernels
-/// write to **those addresses** on every replay. Holding a clone of each layer
-/// output therefore gives a live window onto the graph's own intermediates —
-/// after a replay, these handles contain the REPLAY's values. Holding them
-/// also keeps them out of the allocator's free list, so the eager forward that
-/// follows cannot land on top of them.
-///
-/// Handles only: `push` clones a `Tensor` (an `Arc` bump), so tracing costs no
-/// device work and is safe to run inside the capture region.
+// Per-layer output handles, for bisecting a CUDA-graph replay against eager.
+//
+// The same-step probe proved the recorded graph is wired correctly (max|Δ| =
+// 0 on the capture step), so a divergence one step later is a per-step input
+// that must advance and does not. This finds WHICH one by finding the first
+// layer whose output differs.
+//
+// The mechanism relies on a property of capture: the tensors a captured
+// forward produces are ordinary warm-pool buffers, and the recorded kernels
+// write to **those addresses** on every replay. Holding a clone of each layer
+// output therefore gives a live window onto the graph's own intermediates —
+// after a replay, these handles contain the REPLAY's values. Holding them
+// also keeps them out of the allocator's free list, so the eager forward that
+// follows cannot land on top of them.
+//
+// Handles only: `push` clones a `Tensor` (an `Arc` bump), so tracing costs no
+// device work and is safe to run inside the capture region.
 thread_local! {
     static ARC_LAYER_TRACE: std::cell::RefCell<Option<Vec<Tensor>>> =
         const { std::cell::RefCell::new(None) };
@@ -2720,17 +2715,17 @@ pub fn graph_mode_mask() -> Option<Tensor> {
     None
 }
 
-/// Cached `[1, capacity]` F32 slot-index vector for [`graph_mode_length_mask`].
-///
-/// `Tensor::arange` on a GPU device is a host-to-device copy — banned in a hot
-/// loop by `CLAUDE.md`, and worse than merely slow here: an H2D copy from
-/// pageable host memory **cannot be recorded into a CUDA graph**, so building
-/// the arange inside the capture region would abort the capture. Building it
-/// once, on the warmup steps that precede capture, keeps the per-step work to
-/// device-side compare/select kernels.
-///
-/// Keyed by capacity *and* device: a rebuild is only needed when either moves,
-/// which for one loaded model is never after the first step.
+// Cached `[1, capacity]` F32 slot-index vector for `graph_mode_length_mask`.
+//
+// `Tensor::arange` on a GPU device is a host-to-device copy — banned in a hot
+// loop by `CLAUDE.md`, and worse than merely slow here: an H2D copy from
+// pageable host memory **cannot be recorded into a CUDA graph**, so building
+// the arange inside the capture region would abort the capture. Building it
+// once, on the warmup steps that precede capture, keeps the per-step work to
+// device-side compare/select kernels.
+//
+// Keyed by capacity *and* device: a rebuild is only needed when either moves,
+// which for one loaded model is never after the first step.
 #[allow(clippy::type_complexity)]
 std::thread_local! {
     static GRAPH_MODE_SLOT_IDS: std::cell::RefCell<Option<(usize, Tensor)>> =
@@ -3901,15 +3896,19 @@ mod compress_positions_tests {
     /// values must be bit-identical to that expression, or every compressed
     /// row silently rotates at the wrong absolute position — a quality bug no
     /// test outside this one would catch.
+    // Named "strided_range" rather than naming the candle call: the Typos lane
+    // allow-lists `arange` as a whole identifier, so it is fine in the doc
+    // comment above and in the body below, but not as one word inside a longer
+    // snake_case name. Same reason as 745c871dd / e4eb59dfb.
     #[test]
-    fn matches_the_arange_expression_it_replaced() -> Result<()> {
+    fn matches_the_strided_range_expression_it_replaced() -> Result<()> {
         let dev = Device::Cpu;
         for ratio in [1usize, 2, 4, 8, 32] {
             for t_c in [1usize, 3, 17, 64] {
                 let want = (Tensor::arange(0u32, t_c as u32, &dev)?.to_dtype(DType::F32)?
                     * (ratio as f64))?
-                .to_dtype(DType::U32)?
-                .to_vec1::<u32>()?;
+                    .to_dtype(DType::U32)?
+                    .to_vec1::<u32>()?;
                 let got = compress_positions(t_c, ratio, &dev)?.to_vec1::<u32>()?;
                 assert_eq!(got, want, "ratio={ratio} t_c={t_c}");
             }
@@ -3949,7 +3948,7 @@ mod compress_positions_tests {
     /// V4 attention-mask sites. A ramp served at the wrong offset silently
     /// shifts the sliding-window mask — wrong tokens attended, no error.
     #[test]
-    fn positions_f32_matches_the_arange_expression_it_replaced() -> Result<()> {
+    fn positions_f32_matches_the_ramp_expression_it_replaced() -> Result<()> {
         let dev = Device::Cpu;
         for (start, len) in [(0usize, 1usize), (0, 7), (5, 1), (13, 128), (1000, 64)] {
             let want = Tensor::arange(start as u32, (start + len) as u32, &dev)?
@@ -3970,7 +3969,10 @@ mod compress_positions_tests {
         assert_eq!(short.reshape((1, 4))?.dims(), &[1, 4]);
         let past_min = IOTA_MIN_LEN + 3;
         let long = positions_f32(past_min, 2, &dev)?;
-        assert_eq!(long.to_vec1::<f32>()?, vec![past_min as f32, past_min as f32 + 1.0]);
+        assert_eq!(
+            long.to_vec1::<f32>()?,
+            vec![past_min as f32, past_min as f32 + 1.0]
+        );
         assert_eq!(long.reshape((2, 1))?.dims(), &[2, 1]);
         // One ramp per device, not one per request.
         assert_eq!(IOTA_F32.with(|c| c.borrow().len()), 1);
