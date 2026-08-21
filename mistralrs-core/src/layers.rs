@@ -375,12 +375,27 @@ impl QRmsNorm {
 /// `None` keeps the old loop verbatim, so ragged cohorts behave exactly as they
 /// do today. This is a dispatch fix, not a new ragged path.
 ///
-/// # Relationship to `DeepSeekV2RotaryEmbedding::uniform_offset`
+/// # The V4 rotary, collapsed onto this predicate
 ///
-/// The V4 rotary got this same correction separately (PR #198, still unmerged
-/// at the time of writing) as a private associated function with an identical
-/// body. When these two lines of work meet, collapse that one onto this one --
-/// there must not be two spellings of the same predicate.
+/// The V4 rotary (`DeepSeekV2RotaryEmbedding`) got this same correction
+/// separately, in #198, as a private associated function `uniform_offset` with
+/// a byte-identical body. #198 is now merged and that second spelling is gone:
+/// `DeepSeekV2RotaryEmbedding::{forward, forward_inverse_tail}` call this
+/// function directly, so the two cannot drift apart.
+///
+/// Two details #198 established that this doc did not previously carry:
+///
+/// * The uniformity is not an accident of the current scheduler, it is
+///   *enforced* by it. `scheduler::default_scheduler::select_running_bucket`
+///   admits a forward pass only when cache lengths are exactly equal
+///   ("Sequences may only share a forward pass when their cache lengths are
+///   exactly equal"), and the single producer of a ragged dense batch is gated
+///   behind `ARC_MTP_PER_SEQ_KV`, which defaults off
+///   (`models::deepseek4::ragged_row_q0`).
+/// * Measured at B=256 on a real decode profile, the per-sequence loop cost
+///   ~100,000 GPU launches per step, 19.9% of step time -- of which the
+///   `copy2d` half existed only to undo a split the same function had just
+///   made. That number was measured on #198's branch, not on this tree.
 #[inline]
 pub(crate) fn uniform_seqlen_offset(seqlen_offsets: &[usize]) -> Option<usize> {
     match seqlen_offsets {
@@ -1540,8 +1555,28 @@ impl Qwen2_5VLRotaryEmbedding {
 pub struct DeepSeekV2RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    /// `-sin`, materialised once at construction.
+    ///
+    /// [`Self::forward_inverse_tail`] rotates by the conjugate `(cos, -sin)`.
+    /// It used to spell that as `self.sin.narrow(..)?.neg()?` *inside* the
+    /// per-sequence loop, which at B=256 × 43 layers launched `uneg_bf16`
+    /// **11,008 times per decode step** to negate a `[1, 32]` slice of a
+    /// **constant** table — 0.8% of a measured B=256 step spent re-deriving a
+    /// value that never changes.
+    ///
+    /// Narrowing a pre-negated table is bit-identical to negating a narrowed
+    /// one: negation is a sign-bit flip, exact in every float format and
+    /// elementwise, so it commutes with a view. See `neg_sin_commutes_with_narrow`.
+    neg_sin: Tensor,
 }
 
+// The engagement counters for this path are the ones declared beside
+// `uniform_seqlen_offset` (`rope_cohort_stats`, above). #198 carried a second
+// module of the same name, with the same two atomics and a `counts()` of its
+// own; two `pub mod rope_cohort_stats` in one file is a hard name collision,
+// and two counters for one claim would let a harness read `cohort > 0` off the
+// Phi path while this one never engaged. Collapsed onto the shared module, as
+// `uniform_seqlen_offset`'s doc comment asks.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum DeepSeekV2RopeScaling {
@@ -1583,6 +1618,19 @@ pub struct DeepSeekV2RopeConfig {
 }
 
 impl DeepSeekV2RotaryEmbedding {
+    /// The single place the tables are stored, so `neg_sin` cannot be derived
+    /// in one constructor and forgotten in the other.
+    fn from_tables(sin: Tensor, cos: Tensor) -> Result<Self> {
+        let neg_sin = sin.neg()?;
+        Ok(Self { sin, cos, neg_sin })
+    }
+
+    // The cohort predicate for this rotary is the free function
+    // `uniform_seqlen_offset`, not a method here. #198 introduced
+    // `Self::uniform_offset` with a byte-identical body; per that function's
+    // doc comment ("there must not be two spellings of the same predicate")
+    // the duplicate is collapsed away, and the reasoning it carried has moved
+    // onto the survivor.
     fn new_unscaled(cfg: &DeepSeekV2RopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
         let max_seq_len = cfg.max_position_embeddings;
         let dim = cfg.qk_rope_head_dim;
@@ -1601,7 +1649,7 @@ impl DeepSeekV2RotaryEmbedding {
         let sin = freqs.sin()?.to_dtype(dtype)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
 
-        Ok(Self { sin, cos })
+        Self::from_tables(sin, cos)
     }
 
     fn yarn_find_correction_dim(
@@ -1693,7 +1741,7 @@ impl DeepSeekV2RotaryEmbedding {
         let sin = (freqs.sin()? * mscale as f64)?.to_dtype(dtype)?;
         let cos = (freqs.cos()? * mscale as f64)?.to_dtype(dtype)?;
 
-        Ok(Self { sin, cos })
+        Self::from_tables(sin, cos)
     }
 
     pub fn new(cfg: &DeepSeekV2RopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
@@ -1746,13 +1794,26 @@ impl DeepSeekV2RotaryEmbedding {
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
 
-        if seqlen_offsets.len() == 1 {
-            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
+        // One `rope_i` over the whole cohort whenever every row rotates at the
+        // same position — which is every request today. See
+        // [`uniform_seqlen_offset`] for why this used to read `len() == 1`, and
+        // what that cost.
+        //
+        // Bit-identical to the loop below, not merely close: with a 2-D
+        // `[T, D/2]` cos/sin the kernel's `stride_b` is 0
+        // (`candle-nn/src/rotary_emb.rs`), so every batch row reads the same
+        // cos/sin row, and each output element is an independent
+        // two-multiply-one-add of its own inputs. Batching changes which
+        // launch computes an element, never the arithmetic that produces it.
+        if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+            rope_cohort_stats::record_cohort();
+            let cos = self.cos.narrow(0, offset, seq_len)?;
+            let sin = self.sin.narrow(0, offset, seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
             let k_embed = candle_nn::rotary_emb::rope_i(&k.contiguous()?, &cos, &sin)?;
             Ok((q_embed, k_embed))
         } else {
+            rope_cohort_stats::record_per_sequence();
             let mut q_embeds = Vec::new();
             let mut k_embeds = Vec::new();
             for (i, offset) in seqlen_offsets.iter().enumerate() {
@@ -1789,16 +1850,21 @@ impl DeepSeekV2RotaryEmbedding {
         let (_b, _h, seq_len, head_dim) = x.dims4()?;
         let nope = head_dim - rope_dim;
         let x_nope = x.narrow(3, 0, nope)?;
-        let rotated = if seqlen_offsets.len() == 1 {
-            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?.neg()?;
+        // Same cohort dispatch as `forward`, and the conjugate `sin` now comes
+        // from the pre-negated table (see the `neg_sin` field) rather than a
+        // `neg` launch per sequence per layer.
+        let rotated = if let Some(offset) = uniform_seqlen_offset(seqlen_offsets) {
+            rope_cohort_stats::record_cohort();
+            let cos = self.cos.narrow(0, offset, seq_len)?;
+            let sin = self.neg_sin.narrow(0, offset, seq_len)?;
             let x_pe = x.narrow(3, nope, rope_dim)?.contiguous()?;
             candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?
         } else {
+            rope_cohort_stats::record_per_sequence();
             let mut outs = Vec::new();
             for (i, offset) in seqlen_offsets.iter().enumerate() {
                 let cos = self.cos.narrow(0, *offset, seq_len)?;
-                let sin = self.sin.narrow(0, *offset, seq_len)?.neg()?;
+                let sin = self.neg_sin.narrow(0, *offset, seq_len)?;
                 let x_pe = x
                     .i(i)?
                     .unsqueeze(0)?
@@ -4241,5 +4307,262 @@ mod rope_cohort_tests {
                 "tiled table differs from the per-offset cat for offsets {offsets:?}"
             );
         }
+    }
+}
+
+/// Bit-exactness and engagement tests for the DeepSeek V2/V4 RoPE cohort path.
+///
+/// The change under test replaced `seqlen_offsets.len() == 1` — a test of the
+/// *length* of the offset vector — with a test of the *distinctness of its
+/// values*. At B=256 the length is 256, so the batched path was unreachable at
+/// every batch size above one, while the values were uniform anyway; the
+/// per-sequence loop was therefore performing B bit-identical recomputations
+/// and concatenating them back together (~100,000 GPU launches per decode step
+/// on a measured profile, 19.9% of step time).
+///
+/// Each test below holds the old loop as a verbatim oracle and asserts the new
+/// dispatch reproduces it **bit for bit**, not within a tolerance — a
+/// tolerance-based assertion here would be vacuous, since the claim is that no
+/// arithmetic changed at all.
+#[cfg(test)]
+mod deepseek_rope_cohort_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    const MAX_POS: usize = 32;
+    const ROPE_DIM: usize = 8;
+    const HEAD_DIM: usize = 12;
+    const N_HEADS: usize = 3;
+    const BATCH: usize = 4;
+
+    /// The engagement counters are process-global, so every test that drives a
+    /// forward takes this lock and the deltas it observes are its own.
+    fn guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn rope() -> DeepSeekV2RotaryEmbedding {
+        let cfg = DeepSeekV2RopeConfig {
+            rope_scaling: None,
+            max_position_embeddings: MAX_POS,
+            rope_theta: 10000.0,
+            qk_rope_head_dim: ROPE_DIM,
+        };
+        DeepSeekV2RotaryEmbedding::new(&cfg, DType::F32, &Device::Cpu).unwrap()
+    }
+
+    /// Deterministic, non-degenerate input. Both paths consume the same tensor,
+    /// so randomness would be sound too, but a fixed pattern makes a failure
+    /// reproducible.
+    fn xs(b: usize, h: usize, t: usize, d: usize) -> Tensor {
+        let n = b * h * t * d;
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * 0.37).sin() * 1.7 + 0.11)
+            .collect();
+        Tensor::from_vec(v, (b, h, t, d), &Device::Cpu).unwrap()
+    }
+
+    /// Raw IEEE-754 bit patterns. Float equality would accept `-0.0 == 0.0` and
+    /// silently pass a sign error in the conjugate `sin`; bit patterns do not.
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The pre-fix `forward`, verbatim, as the oracle. Always loops, whatever
+    /// the offsets are.
+    fn reference_forward(
+        re: &DeepSeekV2RotaryEmbedding,
+        q: &Tensor,
+        k: &Tensor,
+        offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b, _h, seq_len, _n) = q.dims4()?;
+        let mut q_embeds = Vec::new();
+        let mut k_embeds = Vec::new();
+        for (i, offset) in offsets.iter().enumerate() {
+            let cos = re.cos.narrow(0, *offset, seq_len)?;
+            let sin = re.sin.narrow(0, *offset, seq_len)?;
+            q_embeds.push(candle_nn::rotary_emb::rope_i(
+                &q.i(i)?.unsqueeze(0)?.contiguous()?,
+                &cos,
+                &sin,
+            )?);
+            k_embeds.push(candle_nn::rotary_emb::rope_i(
+                &k.i(i)?.unsqueeze(0)?.contiguous()?,
+                &cos,
+                &sin,
+            )?);
+        }
+        Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
+    }
+
+    /// The pre-fix `forward_inverse_tail`, verbatim — including the old
+    /// `sin.narrow(..).neg()` spelling, so this oracle also pins the `neg_sin`
+    /// precomputation.
+    fn reference_inverse_tail(
+        re: &DeepSeekV2RotaryEmbedding,
+        x: &Tensor,
+        rope_dim: usize,
+        offsets: &[usize],
+    ) -> Result<Tensor> {
+        let (_b, _h, seq_len, head_dim) = x.dims4()?;
+        let nope = head_dim - rope_dim;
+        let x_nope = x.narrow(3, 0, nope)?;
+        let mut outs = Vec::new();
+        for (i, offset) in offsets.iter().enumerate() {
+            let cos = re.cos.narrow(0, *offset, seq_len)?;
+            let sin = re.sin.narrow(0, *offset, seq_len)?.neg()?;
+            let x_pe = x
+                .i(i)?
+                .unsqueeze(0)?
+                .narrow(3, nope, rope_dim)?
+                .contiguous()?;
+            outs.push(candle_nn::rotary_emb::rope_i(&x_pe, &cos, &sin)?);
+        }
+        let rotated = Tensor::cat(&outs, 0)?;
+        Tensor::cat(&[&x_nope, &rotated], 3)?.contiguous()
+    }
+
+    // The predicate itself is tested once, in `rope_cohort_tests`
+    // (`uniform_offset_tests_values_not_length`), against the same six cases.
+    // #198 carried a byte-identical copy of that test aimed at
+    // `DeepSeekV2RotaryEmbedding::uniform_offset`; with the two spellings
+    // collapsed onto `uniform_seqlen_offset` there is one predicate, so a
+    // second copy would assert nothing the first does not. What is NOT
+    // duplicated, and stays below, is the V4-specific behaviour: `neg_sin`,
+    // `forward_inverse_tail`, and the bit-exactness of this rotary's own
+    // cohort dispatch.
+    #[test]
+    fn neg_sin_commutes_with_narrow() {
+        let re = rope();
+        for offset in [0usize, 1, 17] {
+            let precomputed = re.neg_sin.narrow(0, offset, 3).unwrap();
+            let on_the_fly = re.sin.narrow(0, offset, 3).unwrap().neg().unwrap();
+            assert_eq!(
+                bits(&precomputed),
+                bits(&on_the_fly),
+                "pre-negating the table must be bit-identical at offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn cohort_forward_is_bit_identical_to_the_per_sequence_loop() {
+        let _g = guard();
+        let re = rope();
+        // seq_len 1 is decode; seq_len 2 covers uniform-offset chunked prefill.
+        for seq_len in [1usize, 2] {
+            let q = xs(BATCH, N_HEADS, seq_len, ROPE_DIM);
+            let k = xs(BATCH, 1, seq_len, ROPE_DIM);
+            let offsets = vec![5usize; BATCH];
+
+            let before = rope_cohort_stats::counts();
+            let (q_new, k_new) = re.forward(&q, &k, &offsets).unwrap();
+            let after = rope_cohort_stats::counts();
+            let (q_ref, k_ref) = reference_forward(&re, &q, &k, &offsets).unwrap();
+
+            assert_eq!(q_new.dims(), q_ref.dims());
+            assert_eq!(bits(&q_new), bits(&q_ref), "Q differs at seq_len={seq_len}");
+            assert_eq!(bits(&k_new), bits(&k_ref), "K differs at seq_len={seq_len}");
+            // Prove the batched branch is the one that ran: a fast path that
+            // silently declined would pass the equality above trivially.
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1),
+                (1, 0),
+                "expected exactly one cohort call and no per-sequence loop"
+            );
+        }
+    }
+
+    #[test]
+    fn ragged_forward_still_takes_the_loop_and_still_matches() {
+        let _g = guard();
+        let re = rope();
+        let q = xs(BATCH, N_HEADS, 1, ROPE_DIM);
+        let k = xs(BATCH, 1, 1, ROPE_DIM);
+        let offsets = vec![5usize, 6, 5, 9];
+
+        let before = rope_cohort_stats::counts();
+        let (q_new, k_new) = re.forward(&q, &k, &offsets).unwrap();
+        let after = rope_cohort_stats::counts();
+        let (q_ref, k_ref) = reference_forward(&re, &q, &k, &offsets).unwrap();
+
+        assert_eq!(bits(&q_new), bits(&q_ref));
+        assert_eq!(bits(&k_new), bits(&k_ref));
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, 1),
+            "ragged rows must still take the per-sequence loop"
+        );
+    }
+
+    #[test]
+    fn cohort_inverse_tail_is_bit_identical_to_the_per_sequence_loop() {
+        let _g = guard();
+        let re = rope();
+        for seq_len in [1usize, 2] {
+            let x = xs(BATCH, N_HEADS, seq_len, HEAD_DIM);
+            let offsets = vec![5usize; BATCH];
+
+            let before = rope_cohort_stats::counts();
+            let new = re.forward_inverse_tail(&x, ROPE_DIM, &offsets).unwrap();
+            let after = rope_cohort_stats::counts();
+            let reference = reference_inverse_tail(&re, &x, ROPE_DIM, &offsets).unwrap();
+
+            assert_eq!(new.dims(), reference.dims());
+            assert_eq!(
+                bits(&new),
+                bits(&reference),
+                "inverse tail differs at seq_len={seq_len}"
+            );
+            assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0));
+        }
+    }
+
+    #[test]
+    fn ragged_inverse_tail_still_takes_the_loop_and_still_matches() {
+        let _g = guard();
+        let re = rope();
+        let x = xs(BATCH, N_HEADS, 1, HEAD_DIM);
+        let offsets = vec![5usize, 6, 5, 9];
+
+        let before = rope_cohort_stats::counts();
+        let new = re.forward_inverse_tail(&x, ROPE_DIM, &offsets).unwrap();
+        let after = rope_cohort_stats::counts();
+        let reference = reference_inverse_tail(&re, &x, ROPE_DIM, &offsets).unwrap();
+
+        assert_eq!(bits(&new), bits(&reference));
+        assert_eq!((after.0 - before.0, after.1 - before.1), (0, 1));
+    }
+
+    /// The comparator must be able to fail. Every bit-equality assertion above
+    /// is worthless if `bits` had degenerated into something that always
+    /// matches, so poison one element by a single ULP and require it flagged.
+    #[test]
+    fn the_bit_comparator_is_live() {
+        // Drives a forward, so it must serialise with the counter assertions.
+        let _g = guard();
+        let re = rope();
+        let x = xs(BATCH, N_HEADS, 1, HEAD_DIM);
+        let offsets = vec![5usize; BATCH];
+        let good = re.forward_inverse_tail(&x, ROPE_DIM, &offsets).unwrap();
+
+        let mut poisoned = bits(&good);
+        poisoned[0] += 1; // one ULP
+        assert_ne!(
+            bits(&good),
+            poisoned,
+            "the comparator accepted a one-ULP difference; every other \
+             assertion in this module would be vacuous"
+        );
     }
 }
