@@ -1052,6 +1052,46 @@ fn fp8_wmma_eligible(block_size_y: i32, block_size_x: i32) -> bool {
     block_size_y % n_blk == 0 && block_size_x % k_blk == 0
 }
 
+/// Should this call take `fp8_gemv_wide` instead of `fp8_gemv_warp`, and with
+/// what `scale_shift`?
+///
+/// Parent system: ArcKernels.
+///
+/// The wide kernel is a strict subset of the 32-bit GEMV's domain — it fires
+/// only where `use_gemv` already fired, so it can never take work away from
+/// the tiled GEMM or from cuBLASLt. It then adds four preconditions of its own
+/// (see [`gemv_wide::wide_eligible`]); any shape that fails one keeps
+/// `fp8_gemv_warp`, unchanged, with no error.
+///
+/// 🔴 Default OFF. `ARC_FP8_GEMV_WIDE=1` — and *only* the literal `"1"` —
+/// turns it on. The kernel has never run on a GPU and is not bit-identical to
+/// `fp8_gemv_warp` (it re-associates the f32 accumulation; the exact claim and
+/// its CPU proof are in `blockwise_fp8/gemv_wide.rs`). It must be A/B'd on
+/// hardware against the default before anyone considers flipping it.
+///
+/// The pointers passed here are the ones the kernel will receive, so the
+/// 16-byte alignment a `uint4` load requires is checked on the real address
+/// rather than assumed from the tensor's shape.
+#[cfg(feature = "cuda")]
+fn wide_gemv_shift(
+    use_gemv: bool,
+    k: i32,
+    block_size_x: i32,
+    weight_ptr: u64,
+    input_ptr: u64,
+) -> Option<i32> {
+    use super::gemv_wide;
+    if !use_gemv || !gemv_wide::wide_enabled() {
+        return None;
+    }
+    gemv_wide::wide_eligible(
+        k as usize,
+        block_size_x as usize,
+        weight_ptr as usize,
+        input_ptr as usize,
+    )
+}
+
 /// FP8 blockwise matmul.
 /// Computes output = input @ weight.T where weight is FP8 blockwise quantized.
 /// - input: [M, K] in fp16/bf16
@@ -1186,7 +1226,25 @@ fn fp8_blockwise_matmul_impl(
                 let (output_ptr, _output_guard) = slice_ptr(&output, 0);
                 let (input_ptr, _input_guard) = slice_ptr(input_s, input_l.start_offset());
 
-                if use_gemv {
+                let wide_shift = wide_gemv_shift(use_gemv, k, block_size_x, weight_ptr, input_ptr);
+                if let Some(scale_shift) = wide_shift {
+                    // 🔴 UNVERIFIED ON HARDWARE. `ARC_FP8_GEMV_WIDE=1` only.
+                    unsafe {
+                        ffi::launch_fp8_gemv_wide_f16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            scale_shift,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                } else if use_gemv {
                     unsafe {
                         ffi::launch_fp8_gemv_f16(
                             input_ptr as *const _,
@@ -1257,7 +1315,25 @@ fn fp8_blockwise_matmul_impl(
                 let (output_ptr, _output_guard) = slice_ptr(&output, 0);
                 let (input_ptr, _input_guard) = slice_ptr(input_s, input_l.start_offset());
 
-                if use_gemv {
+                let wide_shift = wide_gemv_shift(use_gemv, k, block_size_x, weight_ptr, input_ptr);
+                if let Some(scale_shift) = wide_shift {
+                    // 🔴 UNVERIFIED ON HARDWARE. `ARC_FP8_GEMV_WIDE=1` only.
+                    unsafe {
+                        ffi::launch_fp8_gemv_wide_bf16(
+                            input_ptr as *const _,
+                            weight_ptr as *const _,
+                            scales_ptr as *const _,
+                            output_ptr as *mut _,
+                            m,
+                            n,
+                            k,
+                            scale_row_stride,
+                            block_size_y,
+                            scale_shift,
+                            dev.cuda_stream().cu_stream(),
+                        )
+                    };
+                } else if use_gemv {
                     unsafe {
                         ffi::launch_fp8_gemv_bf16(
                             input_ptr as *const _,
@@ -1882,6 +1958,86 @@ mod tests {
             max_err = max_err.max(err);
         }
         Ok(max_err)
+    }
+
+    /// Device-side gate for `fp8_gemv_wide` (`ARC_FP8_GEMV_WIDE=1`).
+    ///
+    /// 🔴 THIS IS THE HARDWARE PROOF THE KERNEL DOES NOT YET HAVE. Everything
+    /// asserted about `fp8_gemv_wide` today comes from the CPU mirror in
+    /// `blockwise_fp8/gemv_wide.rs`, which models the accumulation *order* but
+    /// cannot execute a `uint4` load, cannot catch a misaligned address, and
+    /// cannot catch a launch-config error. This test can, and it must be run
+    /// on the first box that touches this branch.
+    ///
+    /// How to run the A/B — the flag is latched in a `OnceLock` on first read,
+    /// so the two legs are two processes, not two test cases:
+    ///
+    /// ```text
+    ///   cargo test -p mistralrs-quant --features cuda fp8_gemv -- --nocapture
+    ///   ARC_FP8_GEMV_WIDE=1 cargo test -p mistralrs-quant --features cuda fp8_gemv -- --nocapture
+    /// ```
+    ///
+    /// Leg 1 exercises `fp8_gemv_warp`, leg 2 `fp8_gemv_wide`, through the
+    /// identical call. Both must pass every assertion below; then diff the
+    /// printed checksums. A checksum that is *equal* between the legs means
+    /// the wide kernel did not engage — check the eligibility gate, not the
+    /// numerics. `ARC_FP8_GEMV_WIDE=0` must reproduce leg 1 exactly; if it
+    /// does not, the env polarity is wrong.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_fp8_gemv_wide_matches_reference() -> Result<()> {
+        let dev = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("CUDA not available; skipping test_fp8_gemv_wide_matches_reference");
+                return Ok(());
+            }
+        };
+        let wide_on = std::env::var("ARC_FP8_GEMV_WIDE").ok().as_deref() == Some("1");
+        let block = vec![128usize, 128usize];
+
+        // K values chosen to hit each structural case of the wide kernel:
+        // an exact multiple of 512; a 128-wide tail; a scalar remainder as
+        // well; and a K under 512 where the wide loop must not run at all.
+        for (m, n, k) in [
+            (1usize, 512usize, 4096usize),
+            (1, 512, 4224),
+            (1, 512, 4240),
+            (1, 512, 256),
+            (1, 8192, 2048),
+            (4, 1024, 1536),
+        ] {
+            let (weight, scales) = make_fp8_weight(&dev, n, k, &block)?;
+            let x = Tensor::randn(0f32, 1f32, (m, k), &dev)?.to_dtype(DType::BF16)?;
+
+            let gemv = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?;
+            assert_eq!(gemv.dims2()?, (m, n));
+
+            let w_dq = ops::fp8_blockwise_dequantize(&weight, &scales, block.clone(), DType::BF16)?;
+            let truth = Linear::new(w_dq, None).forward(&x)?;
+            let err = max_rel_err(&gemv, &truth)?;
+            assert!(
+                err < 1e-2,
+                "wide_on={wide_on} (m={m}, n={n}, k={k}): max rel err {err} exceeds 1e-2"
+            );
+
+            // Deterministic checksum, printed so the two legs can be diffed.
+            let v: Vec<f32> = gemv.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            let sum: f64 = v.iter().map(|&a| a as f64).sum();
+            println!("wide_on={wide_on} m={m} n={n} k={k} err={err:.3e} checksum={sum:.9}");
+        }
+
+        // Determinism: the wide kernel has a fixed lane->k partition, so
+        // repeated launches on identical inputs must be bit-identical.
+        let (weight, scales) = make_fp8_weight(&dev, 1024, 4240, &block)?;
+        let x = Tensor::randn(0f32, 1f32, (1, 4240), &dev)?.to_dtype(DType::BF16)?;
+        let a = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?;
+        let b = ops::fp8_blockwise_matmul_impl(&x, &weight, &scales, &block, Some(true))?;
+        let av: Vec<f32> = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let bv: Vec<f32> = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        assert_eq!(av, bv, "wide_on={wide_on}: GEMV is not deterministic");
+
+        Ok(())
     }
 
     /// GEMV kernel (M=1 decode shape) must match both the tiled GEMM kernel
