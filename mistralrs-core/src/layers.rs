@@ -1771,6 +1771,21 @@ impl DeepSeekV2RotaryEmbedding {
                 return Ok((entry.cos.clone(), entry.sin.clone(), entry.neg_sin.clone()));
             }
         }
+        // Host-side bounds guard, BEFORE any index reaches `index_select`. The
+        // loop arm's `narrow(0, offset, seq_len)` hard-errors past the table
+        // end; `index_select` with an out-of-range index is not reliably
+        // bounds-checked on the CUDA backend and can read garbage SILENTLY.
+        // Both arms must fail loud, and identically-loud — the offsets are
+        // host data, so the check is free.
+        let table_rows = self.cos.dim(0)?;
+        if let Some(&worst) = seqlen_offsets.iter().max() {
+            if worst + seq_len > table_rows {
+                candle_core::bail!(
+                    "rope cohort gather out of bounds: offset {worst} + seq_len {seq_len} \
+                     exceeds the {table_rows}-row cos/sin table (offsets {seqlen_offsets:?})"
+                );
+            }
+        }
         let b = seqlen_offsets.len();
         let mut rows: Vec<u32> = Vec::with_capacity(b * seq_len);
         for &off in seqlen_offsets {
@@ -5002,5 +5017,59 @@ mod deepseek_ragged_cohort_tests {
             (0, 1),
             "with ARC_ROPE_COHORT unset a ragged cohort must take the loop"
         );
+    }
+
+    /// An offset past the table end must ERROR on the cohort arm exactly as it
+    /// does on the loop arm — and it must be THIS module's host-side guard
+    /// that fires, not the backend. The loop's `narrow` fails loud everywhere,
+    /// but `index_select` with an out-of-range index is not reliably
+    /// bounds-checked on CUDA and can read garbage silently; the arm we A/B on
+    /// hardware must not be the one with the quiet failure mode (D18). The
+    /// message substring is pinned so a backend error passing this test by
+    /// coincidence is impossible.
+    #[test]
+    fn out_of_bounds_offset_fails_loud_on_both_arms() {
+        let re = rope();
+        let t = 1usize;
+        // MAX_POS = 32 rows: offset 31 is the last valid row at T=1; 32 is
+        // past the end. The valid rows in the same cohort prove the guard
+        // reports the MAX, not merely offsets[0].
+        let offsets = vec![5usize, 32];
+        let q = xs(2, N_HEADS, t, ROPE_DIM);
+        let k = xs(2, 1, t, ROPE_DIM);
+
+        // Loop arm: narrow(0, 32, 1) on a 32-row table hard-errors.
+        assert!(
+            re.forward_ragged_loop(&q, &k, &offsets, t).is_err(),
+            "the loop arm accepted an offset past the table end"
+        );
+
+        // Cohort arm: must also error, and with the guard's own message.
+        let err = re
+            .forward_ragged_cohort(&q, &k, &offsets, t)
+            .expect_err("the cohort arm accepted an offset past the table end");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rope cohort gather out of bounds"),
+            "the cohort arm rejected the offset, but not via the host-side \
+             guard — got: {msg}"
+        );
+        assert!(
+            msg.contains("offset 32") && msg.contains("32-row"),
+            "the guard's message must name the offending offset and the table \
+             size — got: {msg}"
+        );
+
+        // Same guard on the inverse-tail arm (shared `cohort_tables`).
+        let x = xs(2, N_HEADS, t, HEAD_DIM);
+        let err = re
+            .inverse_tail_ragged_cohort(&x, ROPE_DIM, HEAD_DIM - ROPE_DIM, &offsets, t)
+            .expect_err("the inverse-tail cohort arm accepted an offset past the table end");
+        assert!(err.to_string().contains("rope cohort gather out of bounds"));
+
+        // The boundary itself is not off by one: the last valid row works.
+        let ok = vec![5usize, 31];
+        re.forward_ragged_cohort(&q, &k, &ok, t)
+            .expect("offset 31 + seq_len 1 on a 32-row table is in bounds");
     }
 }
