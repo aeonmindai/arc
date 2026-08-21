@@ -50,7 +50,7 @@
 /// Unset, empty, `0`, `false`, `no`, `off` are no.
 ///
 /// An unrecognised value logs a warning and is treated as **no**. It is not
-/// silently folded into `false`: an operator who wrote `ARC_FOO=ture` needs to
+/// silently folded into `false`: an operator who wrote `ARC_FOO=truu` needs to
 /// find out from the log, not from a result that quietly disagrees with the one
 /// they thought they were producing.
 ///
@@ -119,7 +119,7 @@ mod tests {
         (Some("false"), false),
         (Some("no"), false),
         (Some(""), false),
-        (Some("ture"), false),
+        (Some("truu"), false),
         (Some("2"), false),
         (None, false),
     ];
@@ -292,7 +292,7 @@ mod tests {
     fn unrecognised_value_is_distinguishable_from_off() {
         assert_eq!(env_flag_value(Some("0")), Some(false));
         assert_eq!(env_flag_value(Some("false")), Some(false));
-        assert_eq!(env_flag_value(Some("ture")), None);
+        assert_eq!(env_flag_value(Some("truu")), None);
         assert_eq!(env_flag_value(Some("maybe")), None);
         assert_eq!(env_flag_value(Some("2")), None);
     }
