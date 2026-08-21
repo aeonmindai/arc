@@ -2388,11 +2388,31 @@ impl Pipeline for NormalPipeline {
             let block_size = match self.metadata.cache_config.as_ref() {
                 Some(c) => c.block_size,
                 None => {
+                    // NOTE: for V4 this marker never fires, so its absence from
+                    // a report proves nothing. Two guards close first. (1) The
+                    // engine only calls `autonomous_decode` from the
+                    // `SchedulerOutput::PagedAttention` arm
+                    // (`engine/mod.rs:946`), which V4 does not enter unless
+                    // `ARC_V4_PAGED_ATTN=1`. (2) Even then,
+                    // `self.dedicated_decode.is_none()` above returns first:
+                    // `check_dense_layer_inventory` (`arc-cuda-graph/
+                    // src/weights.rs:169`) demands exactly
+                    // `DENSE_PROJS_PER_LAYER == 7` tagged projections per
+                    // layer. V4's `get_layers` (`models/deepseek4.rs:4905`)
+                    // emits 7 only for the degenerate case of a dense-MLP
+                    // layer with `QProj::Plain` and no compressor
+                    // (q + wkv + wo_a + wo_b + gate/up/down). Every MoE layer
+                    // pushes `moe.get_isq_layers()` instead of the three MLP
+                    // projections, and compressor / `QProj::Lora` layers add
+                    // one more each — so the count differs and the path is
+                    // declined at `normal.rs:1495`, leaving `dedicated_decode`
+                    // `None`. `cache_config` is the guard that binds for dense
+                    // architectures, not for V4.
                     arc_profiler::mark_unreachable(
                         "cuda_graph.autonomous_decode",
-                        "cache_config is None: DeepSeekV4Loader::supports_paged_attention() is \
-                         false, so no PagedAttention cache is ever built for V4",
-                        "normal.rs:1844",
+                        "cache_config is None: the loader's supports_paged_attention() is \
+                         false, so no PagedAttention cache is ever built for this model",
+                        "normal.rs:2388",
                     );
                     tracing::debug!("autonomous_decode: no cache_config, falling back");
                     return Ok(None);

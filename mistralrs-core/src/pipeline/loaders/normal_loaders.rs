@@ -3353,6 +3353,30 @@ impl NormalModelLoader for DeepSeekV4Loader {
         //    **Fix that contract before this flag is worth anything.** Do not
         //    re-rent a box to re-confirm the failure; re-read
         //    `memory/mission/wave53-CD-paged-attn-probe.md` §8.
+        //
+        // 6. THE CONTRACT IS NOW FIXED IN SOURCE, BEHIND A SECOND OPT-IN.
+        //    `ARC_PAGED_PREFILL_FULL_CTXLENS=1` makes the prefill path publish
+        //    `full_context_lens` as `[batch]` per-sequence lengths
+        //    (`inputs_processor.rs`, `build_full_context_lens` in
+        //    `paged_attention/mod.rs`), which `cache_write_and_gather` already
+        //    prefers over the flattened `context_lens`. Set it TOGETHER with
+        //    `ARC_V4_PAGED_ATTN=1`; alone it is inert.
+        //
+        //    Two corrections to item 5, from re-reading the code. (a) The
+        //    mechanism for the dummy-run `0 keys` is NOT the `block_ids
+        //    .is_none()` profiling `continue` — that leaves `block_tables`
+        //    empty, and the very next statement is
+        //    `block_tables.iter().map(|x| x.len()).max().unwrap()`, which would
+        //    PANIC rather than gather nothing. The real mechanism is simpler:
+        //    the engine's dummy prompt is one token, its single absolute slot
+        //    index is `0`, and `cumsum([0])` is `[0, 0]` ⇒ zero rows. (b) That
+        //    unguarded `.max().unwrap()` on an empty `block_tables` is a real
+        //    latent panic, still present, still unfixed — it just is not what
+        //    fired on the A100.
+        //
+        //    UNMEASURED: nothing here has been run on a GPU. Item 5's other
+        //    costs (shadows the CUDA-graph decode arm, O(context) gather per
+        //    layer per step, b=1 only) are unchanged by this fix.
         if v4_paged_attn_optin() {
             return Ok(true);
         }

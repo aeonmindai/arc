@@ -81,9 +81,107 @@ pub(crate) fn build_cu_seqlens_kv_from_context_lens(
     Ok(cu)
 }
 
+/// Build the `[batch]` per-sequence context-length tensor that
+/// [`build_cu_seqlens_kv_from_context_lens`] consumes.
+///
+/// This is the *producer* half of the contract whose two ends disagreed. The
+/// prefill path's `context_lens` field is **not** this: the inputs processor
+/// pushes one ABSOLUTE SLOT INDEX per token and flattens the result to
+/// `[batch * max_context_len]`. `PagedAttention::forward` never reads that
+/// field during prefill, so the mismatch stayed invisible until
+/// `cache_write_and_gather` (RUN-167) became its first prefill consumer.
+///
+/// `gather_kv_cache` documents the required layout at its own signature
+/// (`mistralrs-paged-attn/src/cuda/backend/gather_kv.rs:12-13`):
+/// `block_table: [batch, max_blocks]` and `cu_seq_lens: [batch + 1]`. One
+/// entry per sequence, holding that sequence's total cached length.
+#[allow(dead_code)] // only consumed from the cuda/metal-gated prefill metadata build
+pub(crate) fn build_full_context_lens(
+    lens: &[usize],
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    Tensor::from_vec(
+        lens.iter().map(|x| *x as u32).collect::<Vec<u32>>(),
+        (lens.len(),),
+        device,
+    )
+}
+
 #[cfg(test)]
 mod cu_seqlens_tests {
     use super::*;
+
+    /// The prefill producer/consumer round trip. `build_full_context_lens`
+    /// followed by `build_cu_seqlens_kv_from_context_lens` must yield exactly
+    /// `batch + 1` entries whose last element is the total token count — the
+    /// layout `gather_kv_cache` documents.
+    ///
+    /// This is the regression guard for the measured A100 failure (wave53-CD,
+    /// `ARC_V4_PAGED_ATTN=1`): the prefill path used to hand the consumer its
+    /// flattened absolute-slot-index tensor instead, so a 17-token single-
+    /// sequence prompt produced 18 `cu_seqlens` entries against a
+    /// `[1, max_blocks]` block table (out of bounds) rather than 2.
+    #[test]
+    fn full_context_lens_round_trips_to_batch_plus_one() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+
+        // Single sequence, 17-token prompt — the exact shape of the request
+        // that produced CUDA_ERROR_ILLEGAL_ADDRESS on hardware.
+        let lens = build_full_context_lens(&[17], &device)?;
+        assert_eq!(lens.dim(0)?, 1, "one entry per sequence, not per token");
+        let cu = build_cu_seqlens_kv_from_context_lens(&lens)?;
+        assert_eq!(cu.dim(0)?, 2, "cu_seqlens must be [batch + 1]");
+        assert_eq!(cu.to_vec1::<u32>()?, vec![0u32, 17]);
+
+        // Ragged multi-sequence batch.
+        let lens = build_full_context_lens(&[4, 7, 2], &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&lens)?;
+        assert_eq!(cu.dim(0)?, 4);
+        assert_eq!(cu.to_vec1::<u32>()?, vec![0u32, 4, 11, 13]);
+        Ok(())
+    }
+
+    /// The shape the prefill path used to emit, pinned so the difference is
+    /// explicit rather than folklore. One absolute slot index per token means
+    /// `dim(0)` is the TOKEN count, so the consumer reads a batch of 17 where
+    /// the block table has exactly one row, and the cumsum of indices
+    /// (`0+1+..+16 = 136`) claims 136 gathered tokens for a 17-token prompt.
+    #[test]
+    fn flattened_slot_indices_violate_the_cu_seqlens_contract() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let flattened: Vec<u32> = (0u32..17).collect();
+        let bogus = Tensor::from_vec(flattened, (17,), &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&bogus)?;
+
+        // 18 != batch + 1 == 2. This is the out-of-bounds read.
+        assert_eq!(cu.dim(0)?, 18);
+        let got: Vec<u32> = cu.to_vec1()?;
+        assert_eq!(*got.last().unwrap(), 136, "cumsum of indices, not lengths");
+        assert_ne!(
+            *got.last().unwrap(),
+            17,
+            "if this ever equals the token count the contract stopped being violated"
+        );
+        Ok(())
+    }
+
+    /// A 1-token prompt is the degenerate case that produced
+    /// `dsv4_attention: 1 query rows against only 0 keys` on the engine's own
+    /// dummy run: the single absolute slot index is `0`, so the cumsum is
+    /// `[0, 0]` and `gather_kv_cache` returns zero rows.
+    #[test]
+    fn single_token_prompt_index_zero_gathers_nothing() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let bogus = Tensor::from_vec(vec![0u32], (1,), &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&bogus)?;
+        assert_eq!(cu.to_vec1::<u32>()?, vec![0u32, 0], "zero rows gathered");
+
+        // The fix turns that same prompt into a length of 1.
+        let fixed = build_full_context_lens(&[1], &device)?;
+        let cu = build_cu_seqlens_kv_from_context_lens(&fixed)?;
+        assert_eq!(cu.to_vec1::<u32>()?, vec![0u32, 1], "one row gathered");
+        Ok(())
+    }
 
     /// `build_cu_seqlens_kv_from_context_lens` matches the canonical
     /// "prepend 0 then cumsum" semantics that `gather_kv_cache` expects.

@@ -80,6 +80,42 @@ pub mod text_models_inputs_processor {
         Tensor::cat(&padded_x[..], 0).map_err(anyhow::Error::msg)
     }
 
+    /// `ARC_PAGED_PREFILL_FULL_CTXLENS=1` — publish per-sequence
+    /// `full_context_lens` on the **prefill** path so
+    /// `PagedAttention::cache_write_and_gather` reads a `[batch]` tensor of
+    /// lengths instead of the flattened `[batch * max_context_len]` tensor of
+    /// absolute slot indices that this path has always emitted as
+    /// `context_lens`.
+    ///
+    /// **Off by default; the default path is byte-for-byte what it was.** The
+    /// only reachable consumer of the new field is `cache_write_and_gather`,
+    /// which is reached solely from `models/deepseek4.rs` under
+    /// `ARC_V4_PAGED_ATTN=1` — so this must be set *together with* that flag to
+    /// have any effect. `full_block_tables` is deliberately left `None` here:
+    /// `PagedAttention::forward` keys its `use_full` switch off
+    /// `full_block_tables.is_some()` (`paged_attention/layers/paged_attention.rs:112`),
+    /// so every non-V4 paged model keeps the exact branch it takes today.
+    ///
+    /// Strict `"1"`: unset, empty, or any other value keeps the default. This
+    /// deliberately mirrors `v4_paged_attn_optin_from`
+    /// (`loaders/normal_loaders.rs:3201`) rather than `is_some()` — a flag read
+    /// with presence-not-value semantics is how `ARC_V4_FP8_KV` once made
+    /// *unset* mean *on*. An experiment flag must never turn itself on.
+    fn paged_prefill_full_ctxlens_optin_from(var: Option<&str>) -> bool {
+        var == Some("1")
+    }
+
+    fn paged_prefill_full_ctxlens_optin() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            paged_prefill_full_ctxlens_optin_from(
+                std::env::var("ARC_PAGED_PREFILL_FULL_CTXLENS")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
     #[derive(Clone)]
     pub struct PagedAttentionMeta {
         pub sliding_window: Option<usize>,
@@ -298,6 +334,11 @@ pub mod text_models_inputs_processor {
         let mut slot_mappings = Vec::new();
         let mut block_tables = Vec::new();
         let mut paged_attn_context_lens = Vec::new();
+        // Per-sequence TOTAL cached length, one entry per sequence — the
+        // `[batch]` layout `gather_kv_cache` documents. Distinct from
+        // `paged_attn_context_lens` above, which is one ABSOLUTE SLOT INDEX per
+        // token. See `build_full_context_lens` in `paged_attention/mod.rs`.
+        let mut full_paged_attn_context_lens: Vec<usize> = Vec::new();
         let flash_attn = crate::using_flash_attn();
         let mut seqlens_q = if flash_attn { vec![0] } else { Vec::new() };
         let mut seqlens_k = if flash_attn { vec![0] } else { Vec::new() };
@@ -403,6 +444,13 @@ pub mod text_models_inputs_processor {
                 slot_mappings.push(slot_mapping);
                 paged_attn_context_lens.push(ctxt_len);
                 block_tables.push(table_for_seq);
+                // `slot_end` is this sequence's absolute end index, so after
+                // `reshape_and_cache` writes the new tokens the paged cache
+                // holds `[0, slot_end)` for it — exactly the length a full
+                // gather must return. Pushed inside the same branch as
+                // `block_tables` so the two stay index-aligned when the
+                // `block_ids.is_none()` profiling `continue` above skips a row.
+                full_paged_attn_context_lens.push(slot_end);
             }
         }
 
@@ -491,6 +539,43 @@ pub mod text_models_inputs_processor {
             let mut block_tables_map = HashMap::new();
             let mut context_lens_map = HashMap::new();
 
+            // 🔑 `context_lens` built just above is NOT per-sequence lengths on
+            // this path: the loop pushes one ABSOLUTE SLOT INDEX per token
+            // (`ctxt_len.push(i)`) and `.reshape(((),))` flattens the padded
+            // rows to `[batch * max_context_len]`. `PagedAttention::forward`
+            // never reads it during prefill, so nothing caught the mismatch —
+            // until `cache_write_and_gather` (RUN-167) became its first prefill
+            // consumer and fed it to `build_cu_seqlens_kv_from_context_lens`,
+            // which reads `dim(0)` as the batch and cumsums the values as
+            // lengths. Measured consequences on A100-80G under
+            // `ARC_V4_PAGED_ATTN=1` (wave53-CD): a 1-token prompt has the single
+            // index `0`, so `cu = [0, 0]` and the gather returns zero rows
+            // (`dsv4_attention: 1 query rows against only 0 keys`); a 17-token
+            // prompt yields 18 `cu_seqlens` entries against a `[1, max_blocks]`
+            // block table, reading rows 1..16 out of bounds
+            // (`CUDA_ERROR_ILLEGAL_ADDRESS`).
+            //
+            // `full_context_lens` is the field whose contract is `[batch]`
+            // per-sequence lengths — the decode path already emits exactly that
+            // (`Tensor::from_vec(.., (len,), ..)` further down) and
+            // `gather_kv_cache` documents it at its signature
+            // (`cu_seq_lens: [batch + 1]`). Publishing it here lets
+            // `cache_write_and_gather` prefer it over the flattened tensor,
+            // while `context_lens` itself is left untouched for the existing
+            // vLLM-style consumers.
+            //
+            // `full_block_tables` stays `None` on purpose — see the opt-in doc.
+            let emit_full_context_lens = paged_prefill_full_ctxlens_optin();
+            let full_context_lens_cpu = if emit_full_context_lens {
+                Some(crate::paged_attention::build_full_context_lens(
+                    &full_paged_attn_context_lens,
+                    &Device::Cpu,
+                )?)
+            } else {
+                None
+            };
+            let mut full_context_lens_map = HashMap::new();
+
             for device in devices {
                 slot_mappings_map
                     .insert(device.location(), slot_mappings.clone().to_device(&device)?);
@@ -498,6 +583,10 @@ pub mod text_models_inputs_processor {
                     .insert(device.location(), block_tables.clone().to_device(&device)?);
                 context_lens_map
                     .insert(device.location(), context_lens.clone().to_device(&device)?);
+                if let Some(full_cl) = full_context_lens_cpu.as_ref() {
+                    full_context_lens_map
+                        .insert(device.location(), full_cl.clone().to_device(&device)?);
+                }
             }
 
             Some(PagedAttentionInputMetadata {
@@ -506,8 +595,22 @@ pub mod text_models_inputs_processor {
                 context_lens: Some(context_lens_map),
                 max_context_len: Some(max_context_len),
                 full_block_tables: None,
-                full_context_lens: None,
-                full_max_context_len: None,
+                full_context_lens: if emit_full_context_lens {
+                    Some(full_context_lens_map)
+                } else {
+                    None
+                },
+                full_max_context_len: if emit_full_context_lens {
+                    Some(
+                        full_paged_attn_context_lens
+                            .iter()
+                            .max()
+                            .copied()
+                            .unwrap_or(0),
+                    )
+                } else {
+                    None
+                },
                 is_first_prompt_chunk: chunk_offset_toks == 0,
                 paged_kv_indptr: None,
                 paged_kv_indices: None,
@@ -1541,9 +1644,29 @@ pub mod text_models_inputs_processor {
 
     #[cfg(test)]
     mod tests {
-        use super::{make_prompt_chunk, resolve_row_offsets};
+        use super::{make_prompt_chunk, paged_prefill_full_ctxlens_optin_from, resolve_row_offsets};
         use crate::device_map::DummyDeviceMapper;
         use candle_core::Device;
+
+        /// `ARC_PAGED_PREFILL_FULL_CTXLENS` must be strict `"1"`. An experiment
+        /// flag that treats *unset* or *`"0"`* as ON turns itself on in every
+        /// process that never heard of it — which is precisely how
+        /// `ARC_V4_FP8_KV` shipped as `!(v == "0")` and bricked every V4
+        /// forward for a day (wave43-BU → wave49-BZ).
+        ///
+        /// This also guards against the `var_os(..).is_some()` reading used by
+        /// `ARC_NO_DEDICATED_DECODE` (`normal.rs:1474`), where `=0` disables
+        /// rather than enables.
+        #[test]
+        fn full_ctxlens_optin_is_strict_one() {
+            assert!(paged_prefill_full_ctxlens_optin_from(Some("1")));
+            for off in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some("2")] {
+                assert!(
+                    !paged_prefill_full_ctxlens_optin_from(off),
+                    "{off:?} must not opt in"
+                );
+            }
+        }
 
         /// 🔑 The wire itself: what the model actually receives. `positions` is
         /// `seqlen_offsets`, which is where RoPE places each row's queries and —
