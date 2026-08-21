@@ -93,6 +93,29 @@
  * scales -- a numerics change and a separate kernel, deliberately not done
  * here. Named, not built.
  *
+ * WHERE TO LOOK FIRST IF IT UNDERPERFORMS THAT BOUND (unmeasured)
+ * ---------------------------------------------------------------
+ * Occupancy, most likely. At V4's B=256 decode shapes the grid is
+ * `ceil(N/64) x ceil(M/64)`; for M = 256 and N = 2048 that is 32 x 4 = 128
+ * blocks against an H200's 132 SMs -- roughly ONE wave, one block per SM,
+ * 8 warps out of the 64 an SM can hold. There is very little left to hide
+ * global-load latency behind, and the tail effect is total: a second wave
+ * would cost as much as the first.
+ *
+ * The knobs, in the order worth trying, none of which have been tried:
+ *   1. Smaller M_BLK (32) or N_BLK (32) -- more blocks, more waves, better
+ *      fill at the cost of re-reading operands.
+ *   2. More warps per block, or two K-tiles in flight (double-buffered A/B
+ *      staging with `cp.async`) so the MMA pipe is not stalled on the load.
+ *   3. Split-K, which is the standard answer for a small-M, large-K GEMM and
+ *      the regime decode actually lives in.
+ *
+ * These are deliberately NOT guessed at here. The tile shape is a set of
+ * compile-time constants chosen to match the working precedent in this tree,
+ * and picking a different one without a measurement would be the same mistake
+ * as the two frozen dispatch thresholds documented in blockwise_fp8/ops.rs.
+ * Sweep them on a box.
+ *
  * ALSO CHECKED, AND THE REASON THIS IS HAND-WRITTEN
  * -------------------------------------------------
  * cuBLASLt gained exactly this layout -- `CUBLASLT_MATMUL_DESC_B_SCALE_MODE =
