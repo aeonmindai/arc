@@ -60,6 +60,13 @@ extend-ignore-re = [
 #   optin         : "opt-in" without the hyphen — CUDA's
 #                   cudaDevAttrMaxSharedMemoryPerBlockOptin, and filenames /
 #                   branches that cannot carry a hyphen there
+#   arange        : candle's `Tensor::arange` (numpy naming), which also
+#                   appears as a word segment inside larger identifiers
+#                   (`cached_arange_f32`, `ARANGE_CACHE`) — the
+#                   extend-identifiers entries below only cover the exact
+#                   identifier `arange`, not segments
+"arange" = "arange"
+"ARANGE" = "ARANGE"
 "nd" = "nd"
 "clen" = "clen"
 "tpos" = "tpos"

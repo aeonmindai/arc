@@ -427,7 +427,23 @@ pub struct GlobalOptions {
 #[derive(clap::Args, Clone, Deserialize)]
 pub struct RuntimeOptions {
     /// How many requests may run concurrently.
-    #[arg(long, default_value_t = 32, help_heading = "Serving")]
+    ///
+    /// Default 256. The previous default of 32 capped aggregate throughput far
+    /// below the hardware: at B=32 the physics ceiling on an H200 is ~3,740
+    /// tok/s, so the 14,000 tok/s aggregate gate (which needs B >= 214) was
+    /// unreachable on the default configuration — an admission cap, not a
+    /// kernel limit.
+    ///
+    /// Memory is the real bound, and it scales with this knob: KV/state memory
+    /// is per-sequence (~222 MiB/seq at ctx-4096 for V4 Flash-class models, so
+    /// 256 concurrent sequences is ~55 GiB of context memory on top of the
+    /// weights). PagedAttention deployments are protected by block-budget
+    /// admission (a sequence that does not fit waits for free blocks); the
+    /// `DefaultScheduler` (dense-cache models, including V4) admits by COUNT
+    /// only and has no VRAM-aware check — on small cards, lower this
+    /// explicitly. Wiring the default through a VRAM-aware admission check for
+    /// the dense path is tracked as follow-up, not built here.
+    #[arg(long, default_value_t = 256, help_heading = "Serving")]
     #[serde(default = "default_max_seqs")]
     pub max_seqs: usize,
 
@@ -558,7 +574,7 @@ impl Default for GlobalOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            max_seqs: 32,
+            max_seqs: 256,
             no_kv_cache: false,
             prefix_cache_n: 16,
             chat_template: None,
@@ -580,7 +596,7 @@ fn default_token_source() -> TokenSource {
 }
 
 fn default_max_seqs() -> usize {
-    32
+    256
 }
 
 fn default_prefix_cache_n() -> usize {

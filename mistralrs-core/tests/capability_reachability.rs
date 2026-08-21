@@ -239,6 +239,50 @@ static REGISTRY: &[Capability] = &[
         status: Status::Live,
     },
     Capability {
+        // The mask the entry above forces into existence, built on the DEVICE:
+        // the host triple-loop build (kept as
+        // `make_left_padded_causal_mask_host`, the test oracle) was 4.2 MB of
+        // host work + H2D per token at B=256 ctx-4096, i.e. the thing that
+        // would make ragged decode read as a regression. If production stops
+        // reaching this builder, ragged batches are serving unmasked dead
+        // prefixes — silently wrong, not slow.
+        name: "ragged decode: the left-padded mask is built device-side",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "make_left_padded_causal_mask",
+            defined_in: "mistralrs-core/src/layers_masker.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
+        // The channel the SCHEDULER reads to stop exact-length bucketing.
+        // `batch_can_be_ragged` (above) is the producer; this is the consumer
+        // side, and either going dark re-imposes the one-bucket-per-step
+        // ceiling with no error anywhere.
+        name: "ragged decode: the scheduler reads the published capability",
+        parent: "ArcInfer / ArcSched",
+        check: Check::Symbol {
+            symbol: "ragged_decode_supported",
+            defined_in: "mistralrs-core/src/kv_cache/mod.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
+        // The supported ON-switch for the V4 ragged pair
+        // (`--v4-ragged-decode` / `v4_ragged_decode` config key, with
+        // `ARC_V4_XS_PER_SEQ` as the env fallback). A capability reachable
+        // only through an undocumented env var is indistinguishable from one
+        // that does not exist — which is how the ragged-batching result stayed
+        // off the shipped configuration once already.
+        name: "ragged decode: the CLI/config surface latches the V4 xs flag",
+        parent: "ArcInfer / ArcKV",
+        check: Check::Symbol {
+            symbol: "request_xs_per_sequence",
+            defined_in: "mistralrs-core/src/kv_cache/xs_rolling.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
         name: "prefill admission cap (--prefill-max-seqs)",
         parent: "ArcInfer / ArcSched",
         check: Check::Symbol {
@@ -248,7 +292,11 @@ static REGISTRY: &[Capability] = &[
         status: Status::Live,
     },
     Capability {
-        name: "prompt-starvation floor (--prefill-floor-steps)",
+        // Default ON since arcsched/ragged-and-floor: unset resolves to a
+        // floor of 4 (`DEFAULT_PREFILL_FLOOR_STEPS`);
+        // `ARC_PREFILL_FLOOR_STEPS=0` is the kill-switch that restores the
+        // pre-floor selection key for key.
+        name: "prompt-starvation floor (ARC_PREFILL_FLOOR_STEPS, default 4)",
         parent: "ArcInfer / ArcSched",
         check: Check::Symbol {
             symbol: "prefill_starvation_floor",
