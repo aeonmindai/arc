@@ -982,6 +982,16 @@ pub trait Pipeline:
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
                 let mut embedding_logits = vec![None; input_seqs.len()];
 
+                // STEP_us instrumentation, ported verbatim from the
+                // PagedAttention arm below. That arm carried the only
+                // TOTAL/fwd/sample/other split in the codebase, and V4 cannot
+                // reach it (`DeepSeekV4Loader::supports_paged_attention` is
+                // false) — so the path V4 actually runs had never once
+                // reported how a step divides between GPU and host. The log
+                // format is byte-identical to the paged arm's on purpose:
+                // tooling that parses one parses both.
+                let __np_t_step_start = Instant::now();
+                let mut __np_t_fwd_us: f64 = 0.0;
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
                     let InputProcessorOutput {
@@ -1013,6 +1023,7 @@ pub trait Pipeline:
                     };
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
+                    __np_t_fwd_us += end.duration_since(start).as_secs_f64() * 1e6;
 
                     // ONE host copy for the whole batch, *before* the
                     // per-sequence split. See `host_copy_batched_result`: the
@@ -1204,6 +1215,30 @@ pub trait Pipeline:
                 }
                 let end = Instant::now();
                 exec_duration += end.duration_since(start);
+                let __np_t_sample_us = end.duration_since(start).as_secs_f64() * 1e6;
+                let __np_t_total_us = __np_t_step_start.elapsed().as_secs_f64() * 1e6;
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    static SUM_TOTAL: AtomicU64 = AtomicU64::new(0);
+                    static SUM_FWD: AtomicU64 = AtomicU64::new(0);
+                    static SUM_SAMPLE: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                    SUM_TOTAL.fetch_add(__np_t_total_us as u64, Ordering::Relaxed);
+                    SUM_FWD.fetch_add(__np_t_fwd_us as u64, Ordering::Relaxed);
+                    SUM_SAMPLE.fetch_add(__np_t_sample_us as u64, Ordering::Relaxed);
+                    if n > 4 && (n - 4) % 25 == 0 {
+                        let nn = (n - 4) as f64;
+                        let total = SUM_TOTAL.load(Ordering::Relaxed) as f64 / nn;
+                        let fwd = SUM_FWD.load(Ordering::Relaxed) as f64 / nn;
+                        let samp = SUM_SAMPLE.load(Ordering::Relaxed) as f64 / nn;
+                        let other = total - fwd - samp;
+                        tracing::info!(
+                            "STEP_us avg over {} steps: TOTAL={:.0} fwd={:.0} sample={:.0} other={:.0} (=> {:.1} tok/s)",
+                            n - 4, total, fwd, samp, other, 1e6 / total
+                        );
+                    }
+                }
 
                 Ok(exec_duration)
             }
