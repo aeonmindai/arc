@@ -23,7 +23,8 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
+        EitherCache, IsqModel, KvCache, NormalCache, NormalCacheType, NormalLoadingMetadata,
+        NormalModel,
     },
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
@@ -392,6 +393,43 @@ pub struct Model {
     cfg: ModelConfigMetadata,
 }
 
+/// One [`NormalCacheType`] per decoder layer, matching Gemma-2's alternation.
+///
+/// 🔴 This exists because the constructor used to call
+/// `NormalCache::new_sliding(cfg.num_hidden_layers, .., Some(cfg.sliding_window))`,
+/// which hands **every** layer a `KvCache::Rotating` ring of `sliding_window`
+/// entries. Gemma-2 alternates SWA / global (`Attention::new`:
+/// `use_sliding_window: layer_idx.is_multiple_of(2)`, "Order is SWA, global,
+/// SWA"), so the odd, **global-attention** layers were given a 4096-entry ring
+/// buffer too.
+///
+/// Below 4096 tokens that is merely wasteful. At and beyond 4096 it is wrong:
+/// the ring wraps, so a global layer sees only the last 4096 keys, in *ring*
+/// order rather than positional order, while `forward` masks it with the
+/// non-windowed `attention_mask`. The mask cannot correct for it -- it does not
+/// know the rows have been rotated -- so the model degrades silently instead of
+/// erroring. Gemma-2's own `max_position_embeddings` is 8192, i.e. exactly
+/// twice the window, so the broken regime is inside the supported context.
+///
+/// The predicate here must stay identical to `Attention::new`'s; the pairing is
+/// pinned by `gemma2_cache_type_tests::cache_types_match_attention_layers`.
+pub(crate) fn cache_types(cfg: &Config) -> Vec<NormalCacheType> {
+    (0..cfg.num_hidden_layers)
+        .map(|layer_idx| {
+            if layer_idx.is_multiple_of(2) {
+                // Order is SWA, global, SWA -- same predicate as `Attention::new`.
+                NormalCacheType::SlidingWindow {
+                    window: cfg.sliding_window,
+                }
+            } else {
+                NormalCacheType::Normal {
+                    max_seq_len: cfg.max_position_embeddings,
+                }
+            }
+        })
+        .collect()
+}
+
 impl Model {
     pub fn new(
         cfg: &Config,
@@ -483,11 +521,10 @@ impl Model {
             ))?),
             device: normal_loading_metadata.real_device,
             hidden_size: cfg.hidden_size,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-                Some(cfg.sliding_window),
-            )),
+            // Per-layer cache kinds -- see `cache_types`. This used to be
+            // `new_sliding(.., Some(window))`, which gave the global layers a
+            // ring buffer as well.
+            cache: EitherCache::Normal(NormalCache::from_types(cache_types(cfg))),
             max_seq_len: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,
             final_logit_softcapping: cfg.final_logit_softcapping,
@@ -824,5 +861,95 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn amoe_supported(&self) -> bool {
         true
+    }
+}
+
+/// Gemma-2 gives every *other* layer a sliding window; the KV cache must agree.
+///
+/// The bug these pin: `NormalCache::new_sliding(n, _, Some(window))` builds `n`
+/// **identical** `Rotating` slots, so the global-attention layers were handed a
+/// `sliding_window`-entry ring buffer. Past `sliding_window` tokens the ring
+/// wraps and a global layer can no longer see the whole prefix -- silently,
+/// because the non-windowed mask it is paired with has no way to notice.
+#[cfg(test)]
+mod gemma2_cache_type_tests {
+    use super::*;
+
+    /// google/gemma-2-9b-it: 42 layers, window 4096, context 8192 -- i.e. the
+    /// context is twice the window, so the broken regime is *inside* the
+    /// supported range, not beyond it.
+    fn cfg() -> Config {
+        Config {
+            num_hidden_layers: 42,
+            sliding_window: 4096,
+            max_position_embeddings: 8192,
+            ..Default::default()
+        }
+    }
+
+    /// The layer kinds must alternate SWA / global starting at SWA, which is
+    /// the same predicate `Attention::new` uses for `use_sliding_window`.
+    #[test]
+    fn cache_types_match_attention_layers() {
+        let cfg = cfg();
+        let types = cache_types(&cfg);
+        assert_eq!(types.len(), cfg.num_hidden_layers);
+        for (layer_idx, ty) in types.iter().enumerate() {
+            // Mirrors `Attention::new`: `use_sliding_window: layer_idx.is_multiple_of(2)`.
+            let attention_layer_slides = layer_idx.is_multiple_of(2);
+            match ty {
+                NormalCacheType::SlidingWindow { window } => {
+                    assert!(
+                        attention_layer_slides,
+                        "layer {layer_idx} attends globally but was given a ring buffer"
+                    );
+                    assert_eq!(*window, cfg.sliding_window);
+                }
+                NormalCacheType::Normal { max_seq_len } => {
+                    assert!(
+                        !attention_layer_slides,
+                        "layer {layer_idx} uses SWA but was given a full-length cache"
+                    );
+                    assert_eq!(*max_seq_len, cfg.max_position_embeddings);
+                }
+            }
+        }
+    }
+
+    /// The regression itself, at the level of the cache actually constructed:
+    /// before the fix every slot was `Rotating`, so the `Normal` assertion on
+    /// odd layers is exactly what used to fail.
+    #[test]
+    fn global_layers_get_a_full_length_cache_not_a_ring() {
+        let cfg = cfg();
+        let cache = NormalCache::from_types(cache_types(&cfg));
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.0.len(), cfg.num_hidden_layers);
+
+        let rotating = cache
+            .0
+            .iter()
+            .filter(|c| matches!(c, KvCache::Rotating { .. }))
+            .count();
+        // 42 layers -> 21 SWA, 21 global. Not 42 rotating, which is what
+        // `new_sliding` produced.
+        assert_eq!(rotating, 21, "expected half the layers to slide, got {rotating}");
+
+        for (layer_idx, slot) in cache.0.iter().enumerate() {
+            if layer_idx.is_multiple_of(2) {
+                assert!(
+                    matches!(slot, KvCache::Rotating { .. }),
+                    "SWA layer {layer_idx} must use a rotating cache"
+                );
+            } else {
+                assert!(
+                    !matches!(slot, KvCache::Rotating { .. }),
+                    "global layer {layer_idx} must NOT use a rotating cache -- \
+                     it wraps at {} tokens inside a {}-token context",
+                    cfg.sliding_window,
+                    cfg.max_position_embeddings
+                );
+            }
+        }
     }
 }
