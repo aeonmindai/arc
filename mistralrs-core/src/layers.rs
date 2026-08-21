@@ -433,11 +433,64 @@ pub mod rope_cohort_stats {
     #[inline]
     pub(super) fn record_cohort() {
         COHORT.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        bump_local(1, 0);
     }
 
     #[inline]
     pub(super) fn record_per_sequence() {
         PER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        bump_local(0, 1);
+    }
+
+    // ---- Test-only per-thread mirror of the two counters above. -----------
+    //
+    // The atomics are process-global and, since #198 collapsed its own private
+    // copy of this module onto this one, they are written by EVERY rotary in
+    // this file -- `RotaryEmbedding`, `Llama3RotaryEmbedding`,
+    // `Phi4MMRotaryEmbedding` and `DeepSeekV2RotaryEmbedding` alike. A test
+    // that brackets one call with `counts()` is therefore not measuring its own
+    // call: `cargo test` runs the suite on many threads, and any other test
+    // that drives any rotary lands between the `before` and the `after`.
+    //
+    // That is not hypothetical. Two rotary forwards in `deepseek4.rs`
+    // (`standard_layer_rope_is_unscaled_and_compressed_is_not`,
+    // `mtp_block_takes_the_standard_unscaled_rope_table`) race the cohort tests
+    // exactly this way -- caught by merging #198 and #121 together and running
+    // the full suite, where `--test-threads=1` passes 707 and the parallel run
+    // fails one.
+    //
+    // A mutex was the first fix and it is the wrong one: it obliges every
+    // present and future test that touches any rotary to know about a lock in
+    // another module, which nothing enforces and the next such test will
+    // forget. Counting per-thread instead makes each test's delta its own by
+    // construction, needs no cooperation from anyone else, and leaves the
+    // serving instrument -- the global `counts()` -- byte-for-byte unchanged.
+
+    #[cfg(test)]
+    thread_local! {
+        static LOCAL: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn bump_local(cohort: u64, per_sequence: u64) {
+        LOCAL.with(|c| {
+            let (a, b) = c.get();
+            c.set((a + cohort, b + per_sequence));
+        });
+    }
+
+    /// `(cohort, per_sequence)` for THIS thread only — the test-facing
+    /// counterpart of [`counts`].
+    ///
+    /// Same monotonic-delta contract, same meaning, but immune to whatever the
+    /// rest of the suite is doing on other threads. Tests assert on deltas
+    /// around their own call; nothing resets it.
+    #[cfg(test)]
+    pub fn local_counts() -> (u64, u64) {
+        LOCAL.with(|c| c.get())
     }
 }
 
@@ -4176,9 +4229,9 @@ mod rope_cohort_tests {
         let k = xs(&[B, H, T, D_HEAD], 0.019);
         let offsets = vec![5usize; B];
 
-        let before = rope_cohort_stats::counts();
+        let before = rope_cohort_stats::local_counts();
         let (qb, kb) = re.forward(&q, &k, &offsets).unwrap();
-        let after = rope_cohort_stats::counts();
+        let after = rope_cohort_stats::local_counts();
 
         // A green result must prove work happened: the batched arm has to have
         // been the one that ran.
@@ -4209,9 +4262,9 @@ mod rope_cohort_tests {
         let k = xs(&[3, H, T, D_HEAD], 0.019);
         let offsets = vec![0usize, 4, 9];
 
-        let before = rope_cohort_stats::counts();
+        let before = rope_cohort_stats::local_counts();
         let (qb, kb) = re.forward(&q, &k, &offsets).unwrap();
-        let after = rope_cohort_stats::counts();
+        let after = rope_cohort_stats::local_counts();
         assert!(
             after.1 > before.1,
             "ragged cohort must NOT take the batched path"
@@ -4327,7 +4380,6 @@ mod rope_cohort_tests {
 #[cfg(test)]
 mod deepseek_rope_cohort_tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const MAX_POS: usize = 32;
     const ROPE_DIM: usize = 8;
@@ -4335,14 +4387,15 @@ mod deepseek_rope_cohort_tests {
     const N_HEADS: usize = 3;
     const BATCH: usize = 4;
 
-    /// The engagement counters are process-global, so every test that drives a
-    /// forward takes this lock and the deltas it observes are its own.
-    fn guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
+    // Engagement is asserted through `rope_cohort_stats::local_counts()`, the
+    // per-thread mirror of the global counters. #198 originally serialised
+    // these tests on a private mutex, which worked only while this module also
+    // carried its own private copy of `rope_cohort_stats`; once the two counter
+    // modules were collapsed the atomics became shared and a private lock
+    // stopped serialising anything that mattered. A shared lock was the next
+    // attempt and it is still wrong -- it obliges unrelated tests in other
+    // modules to know about it. See `rope_cohort_stats` for why per-thread
+    // counting is the fix.
 
     fn rope() -> DeepSeekV2RotaryEmbedding {
         let cfg = DeepSeekV2RopeConfig {
@@ -4457,7 +4510,6 @@ mod deepseek_rope_cohort_tests {
 
     #[test]
     fn cohort_forward_is_bit_identical_to_the_per_sequence_loop() {
-        let _g = guard();
         let re = rope();
         // seq_len 1 is decode; seq_len 2 covers uniform-offset chunked prefill.
         for seq_len in [1usize, 2] {
@@ -4465,9 +4517,9 @@ mod deepseek_rope_cohort_tests {
             let k = xs(BATCH, 1, seq_len, ROPE_DIM);
             let offsets = vec![5usize; BATCH];
 
-            let before = rope_cohort_stats::counts();
+            let before = rope_cohort_stats::local_counts();
             let (q_new, k_new) = re.forward(&q, &k, &offsets).unwrap();
-            let after = rope_cohort_stats::counts();
+            let after = rope_cohort_stats::local_counts();
             let (q_ref, k_ref) = reference_forward(&re, &q, &k, &offsets).unwrap();
 
             assert_eq!(q_new.dims(), q_ref.dims());
@@ -4485,15 +4537,14 @@ mod deepseek_rope_cohort_tests {
 
     #[test]
     fn ragged_forward_still_takes_the_loop_and_still_matches() {
-        let _g = guard();
         let re = rope();
         let q = xs(BATCH, N_HEADS, 1, ROPE_DIM);
         let k = xs(BATCH, 1, 1, ROPE_DIM);
         let offsets = vec![5usize, 6, 5, 9];
 
-        let before = rope_cohort_stats::counts();
+        let before = rope_cohort_stats::local_counts();
         let (q_new, k_new) = re.forward(&q, &k, &offsets).unwrap();
-        let after = rope_cohort_stats::counts();
+        let after = rope_cohort_stats::local_counts();
         let (q_ref, k_ref) = reference_forward(&re, &q, &k, &offsets).unwrap();
 
         assert_eq!(bits(&q_new), bits(&q_ref));
@@ -4507,15 +4558,14 @@ mod deepseek_rope_cohort_tests {
 
     #[test]
     fn cohort_inverse_tail_is_bit_identical_to_the_per_sequence_loop() {
-        let _g = guard();
         let re = rope();
         for seq_len in [1usize, 2] {
             let x = xs(BATCH, N_HEADS, seq_len, HEAD_DIM);
             let offsets = vec![5usize; BATCH];
 
-            let before = rope_cohort_stats::counts();
+            let before = rope_cohort_stats::local_counts();
             let new = re.forward_inverse_tail(&x, ROPE_DIM, &offsets).unwrap();
-            let after = rope_cohort_stats::counts();
+            let after = rope_cohort_stats::local_counts();
             let reference = reference_inverse_tail(&re, &x, ROPE_DIM, &offsets).unwrap();
 
             assert_eq!(new.dims(), reference.dims());
@@ -4530,14 +4580,13 @@ mod deepseek_rope_cohort_tests {
 
     #[test]
     fn ragged_inverse_tail_still_takes_the_loop_and_still_matches() {
-        let _g = guard();
         let re = rope();
         let x = xs(BATCH, N_HEADS, 1, HEAD_DIM);
         let offsets = vec![5usize, 6, 5, 9];
 
-        let before = rope_cohort_stats::counts();
+        let before = rope_cohort_stats::local_counts();
         let new = re.forward_inverse_tail(&x, ROPE_DIM, &offsets).unwrap();
-        let after = rope_cohort_stats::counts();
+        let after = rope_cohort_stats::local_counts();
         let reference = reference_inverse_tail(&re, &x, ROPE_DIM, &offsets).unwrap();
 
         assert_eq!(bits(&new), bits(&reference));
@@ -4550,7 +4599,6 @@ mod deepseek_rope_cohort_tests {
     #[test]
     fn the_bit_comparator_is_live() {
         // Drives a forward, so it must serialise with the counter assertions.
-        let _g = guard();
         let re = rope();
         let x = xs(BATCH, N_HEADS, 1, HEAD_DIM);
         let offsets = vec![5usize; BATCH];
