@@ -1973,6 +1973,12 @@ pub(crate) fn gather_gemv_2b_cuda(
     // One pair per `grid.y` index; past `maxGridSize[1]` the launch fails
     // silently and the zero-filled output buffer is returned as if valid.
     super::gather_policy::check_gather_gemv_pairs(n_pairs, "qtip2b gather gemv CUDA")?;
+    // Expert-weight byte accounting (ARC_MOE_BYTE_PROBE=1). This kernel is
+    // indexed `pair = blockIdx.y` and each block loads its own expert's packed
+    // rows, so summed over `blockIdx.x` one pair reads one whole expert and a
+    // launch reads `n_pairs * n_rows * packed_per_row` bytes with no sharing
+    // between pairs. Relaxed atomics only: no device sync, capture-safe.
+    super::byte_probe::record_gemv(n_pairs, n_rows, packed_per_row, num_experts);
     let x_2d = x_rotated.contiguous()?;
     let indices = indices.flatten_all()?.contiguous()?;
 
