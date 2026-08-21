@@ -476,8 +476,13 @@ with the host passing `log2(block_size_x)` and refusing non-powers-of-two, a
 bit-identical** (f32 re-association). Its projected ~1.6× on the kernel /
 ~1.3 ms/token is a **projection**. Do not let it be quoted as a measurement.
 
-⚠️ **And the 16.0% share it multiplies has the same provenance problem as §6's
-27.2%** — see the FACTS retraction.
+⚠️ **And the 16.0% "share of kernel time" that projection multiplies is itself
+unsourced on master.** Its only home is `docs/engineering/OPENROUTER_READY.md`,
+which **does not exist on master** — it lives on branches
+`agent/tail-sinkhorn-warp-v2` and `agent/decode-share-probe` — on the same line
+as the 27.2% TAIL figure retracted in `FACTS.md` §2026-08-21. **Two numbers, one
+unmerged source, and one of them is already being multiplied into a projected
+win.**
 
 ---
 
