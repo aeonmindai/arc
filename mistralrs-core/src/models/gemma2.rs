@@ -933,7 +933,10 @@ mod gemma2_cache_type_tests {
             .count();
         // 42 layers -> 21 SWA, 21 global. Not 42 rotating, which is what
         // `new_sliding` produced.
-        assert_eq!(rotating, 21, "expected half the layers to slide, got {rotating}");
+        assert_eq!(
+            rotating, 21,
+            "expected half the layers to slide, got {rotating}"
+        );
 
         for (layer_idx, slot) in cache.0.iter().enumerate() {
             if layer_idx.is_multiple_of(2) {

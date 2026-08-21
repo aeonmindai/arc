@@ -439,11 +439,7 @@ pub mod rope_cohort_stats {
 /// Uniform cohorts get one broadcast + one copy instead of `b` narrows and a
 /// `b`-way `cat`; ragged cohorts keep the `cat`, which is the only thing that
 /// can express them.
-fn cohort_rotary_table(
-    table: &Tensor,
-    seqlen_offsets: &[usize],
-    seq_len: usize,
-) -> Result<Tensor> {
+fn cohort_rotary_table(table: &Tensor, seqlen_offsets: &[usize], seq_len: usize) -> Result<Tensor> {
     match uniform_seqlen_offset(seqlen_offsets) {
         Some(offset) => {
             let rows = table.narrow(0, offset, seq_len)?;
@@ -3805,7 +3801,12 @@ mod rope_cohort_tests {
 
     /// The pre-fix per-sequence loop, verbatim, as the oracle. Always loops,
     /// whatever the offsets are.
-    fn reference(re: &RotaryEmbedding, q: &Tensor, k: &Tensor, offsets: &[usize]) -> (Tensor, Tensor) {
+    fn reference(
+        re: &RotaryEmbedding,
+        q: &Tensor,
+        k: &Tensor,
+        offsets: &[usize],
+    ) -> (Tensor, Tensor) {
         let seq_len = q.dim(2).unwrap();
         let mut q_embeds = Vec::new();
         let mut k_embeds = Vec::new();
@@ -3813,12 +3814,20 @@ mod rope_cohort_tests {
             let cos = re.cos.narrow(0, *offset, seq_len).unwrap();
             let sin = re.sin.narrow(0, *offset, seq_len).unwrap();
             q_embeds.push(
-                candle_nn::rotary_emb::rope(&q.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(), &cos, &sin)
-                    .unwrap(),
+                candle_nn::rotary_emb::rope(
+                    &q.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(),
+                    &cos,
+                    &sin,
+                )
+                .unwrap(),
             );
             k_embeds.push(
-                candle_nn::rotary_emb::rope(&k.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(), &cos, &sin)
-                    .unwrap(),
+                candle_nn::rotary_emb::rope(
+                    &k.i(i).unwrap().unsqueeze(0).unwrap().contiguous().unwrap(),
+                    &cos,
+                    &sin,
+                )
+                .unwrap(),
             );
         }
         (
@@ -3860,8 +3869,16 @@ mod rope_cohort_tests {
         );
 
         let (qref, kref) = reference(&re, &q, &k, &offsets);
-        assert_eq!(bits(&qb), bits(&qref), "batched q differs from per-sequence");
-        assert_eq!(bits(&kb), bits(&kref), "batched k differs from per-sequence");
+        assert_eq!(
+            bits(&qb),
+            bits(&qref),
+            "batched q differs from per-sequence"
+        );
+        assert_eq!(
+            bits(&kb),
+            bits(&kref),
+            "batched k differs from per-sequence"
+        );
     }
 
     /// Ragged offsets must still take the per-sequence loop and still be right.
@@ -3902,8 +3919,8 @@ mod rope_cohort_tests {
     /// dispatch, so it gets the same guarantee.
     #[test]
     fn uniform_cohort_is_bit_identical_for_gpt_j_style() {
-        let re =
-            RotaryEmbedding::new(10000.0, D_HEAD, MAX_POS, &Device::Cpu, false, DType::F32).unwrap();
+        let re = RotaryEmbedding::new(10000.0, D_HEAD, MAX_POS, &Device::Cpu, false, DType::F32)
+            .unwrap();
         let q = xs(&[B, H, T, D_HEAD], 0.023);
         let k = xs(&[B, H, T, D_HEAD], 0.029);
         let offsets = vec![11usize; B];

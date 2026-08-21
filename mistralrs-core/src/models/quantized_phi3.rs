@@ -369,7 +369,7 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor, Option<Tensor>, Option<Tensor>)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let (_b_sz, seq_len) = input_ids.dims2()?;
+        let (_b_sz, _seq_len) = input_ids.dims2()?;
         let mut xs = self.tok_embeddings.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(

@@ -160,6 +160,11 @@ pub use kv_cache::{
 /// same reason `set_mtp_load_depth` is: the identity guard has to drive the
 /// same model both ways from one test binary.
 pub use models::deepseek4::{set_v4_kv_window, v4_kv_window_enabled};
+// `fused_v_stats`: engagement counters for V4's aliased-V fast path, reachable
+// so a serving or benchmark harness can read them. Skipping a redundant KV copy
+// leaves no trace in the output, so `aliased == 0` after a V4 decode is an
+// environment failure, not a result. See the module's own docs.
+pub use models::dsv4_attention::fused_v_stats;
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
