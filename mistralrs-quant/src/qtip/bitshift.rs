@@ -1931,7 +1931,9 @@ impl QuantMethod for Qtip2bLayer {
                             )
                     }
                 };
-                let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
+                // Read by VALUE: `ARC_NO_QTIP_ONDEVICE_MOE=0` leaves the
+                // on-device path enabled (the default).
+                let ondevice_disabled = crate::env_flag_is_set("ARC_NO_QTIP_ONDEVICE_MOE");
                 if !ondevice_disabled
                     && ondevice_preferred
                     && n_tokens.saturating_mul(n_experts_per_tok)
@@ -1946,7 +1948,9 @@ impl QuantMethod for Qtip2bLayer {
                 // 2-bit MoE serving actually lives. 16-bit activations only
                 // (the mma.sync pipeline is the point); other dtypes keep
                 // the CPU reference below.
-                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                // Read by VALUE: `ARC_NO_QTIP_GROUPED_MOE=0` leaves the grouped
+                // GEMM enabled (the default).
+                let grouped_disabled = crate::env_flag_is_set("ARC_NO_QTIP_GROUPED_MOE");
                 if !grouped_disabled
                     && matches!(a.dtype(), DType::BF16 | DType::F16)
                     && self

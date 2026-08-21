@@ -1904,7 +1904,7 @@ impl Pipeline for NormalPipeline {
                 // replay and discard it, using eager for the real logits.
                 #[cfg(feature = "cuda")]
                 {
-                    let probe = std::env::var_os("ARC_V4_CAPTURE_PROBE").is_some();
+                    let probe = mistralrs_quant::env_flag_is_set("ARC_V4_CAPTURE_PROBE");
                     // Shadowed (cuda-only) so step 2b can swap in the
                     // address-stable buffer without making the outer
                     // destructuring binding `mut`, which would warn on every

@@ -179,7 +179,7 @@ pub fn floor_mtp_isq(
     if !isq_is_sub_int8(ty) {
         return requested;
     }
-    if std::env::var_os("ARC_MTP_ALLOW_SUB_INT8").is_some() {
+    if mistralrs_quant::env_flag_is_set("ARC_MTP_ALLOW_SUB_INT8") {
         warn_sub_int8_once(ty, None);
         return requested;
     }

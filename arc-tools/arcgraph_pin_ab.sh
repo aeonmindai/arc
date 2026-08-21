@@ -9,6 +9,21 @@
 #   PIN  arm : flag unset      -> xs_rolling logs "PINNED"
 #   CTRL arm : flag = 0        -> xs_rolling logs "RESIZING"
 #
+# 🔴 THIS SCRIPT CANNOT PRODUCE A VERDICT ON master AS OF cc5487ad3. DO NOT
+# BOOK GPU TIME FOR IT UNTIL THE FLAG BELOW EXISTS.
+#
+# `ARC_V4_XS_PIN_WINDOW` is read by NOTHING in the tree — the name appears only
+# in this file. Neither does the "xs rolling window is PINNED/RESIZING" log line
+# this script greps for, at `xs_rolling.rs:241` or anywhere else. The nearest
+# real flag is `ARC_V4_XS_PER_SEQ` (`kv_cache/xs_rolling.rs:233`), which is a
+# different thing: per-sequence ragged decode, not window pinning.
+#
+# So both arms would run in the SAME state, which is exactly the failure the
+# assertion below was written to catch. It does catch it — the run exits 2 with
+# "PIN A/B IS VOID" rather than reporting "the pin is free" — but only after two
+# full model loads and two generations have been paid for. Verified during the
+# env-flag polarity sweep, 2026-08-21.
+#
 # ⚠️ THE ASSERTION THAT MAKES THE COMPARISON MEAN ANYTHING.
 # Both strings are compiled into the binary — presence proves nothing. What
 # proves the arms differ is the RUNTIME log line, emitted once per process by
@@ -33,6 +48,21 @@ export PATH="$CUDA_HOME/bin:/root/.cargo/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
 say(){ echo "[$(date -u +%H:%M:%S)] $*" | tee -a $S; }
 PID=""
+
+# Fail before spending GPU time, not after. `strings` on the binary is enough:
+# if the flag name is not compiled in, nothing reads it, and the two arms are
+# the same arm. Set PIN_AB_FORCE=1 to run anyway (e.g. against a binary built
+# from a branch that adds the flag).
+if [ "${PIN_AB_FORCE:-0}" != "1" ] && [ -r "$BIN" ] \
+   && ! strings "$BIN" 2>/dev/null | grep -q ARC_V4_XS_PIN_WINDOW; then
+  say "🔴 REFUSING TO RUN: $BIN does not contain ARC_V4_XS_PIN_WINDOW, so the"
+  say '   ctrl arm (ARC_V4_XS_PIN_WINDOW=0) and the pin arm (unset) are the SAME'
+  say "   arm. This would burn two model loads to reach 'PIN A/B IS VOID'."
+  say "   See the header comment for what to do instead."
+  say "RESULT: UNANSWERED (flag not present in binary)"
+  exit 2
+fi
+
 cleanup(){ [ -n "$PID" ] && kill $PID 2>/dev/null; sleep 3; [ -n "$PID" ] && kill -9 $PID 2>/dev/null; pkill -f "mistralrs serve -p $PORT" 2>/dev/null; return 0; }
 trap cleanup EXIT INT TERM
 

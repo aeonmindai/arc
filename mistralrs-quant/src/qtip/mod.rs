@@ -3654,7 +3654,9 @@ impl QuantMethod for QtipLayer {
                 // the kernel's real structural limit (grid.y = n_pairs <=
                 // 65535). See `gather_policy` for the arithmetic.
                 let num_experts = self.num_experts_count();
-                let grouped_disabled = std::env::var("ARC_NO_QTIP_GROUPED_MOE").is_ok();
+                // Read by VALUE: `ARC_NO_QTIP_GROUPED_MOE=0` leaves the grouped
+                // GEMM enabled (the default).
+                let grouped_disabled = crate::env_flag_is_set("ARC_NO_QTIP_GROUPED_MOE");
                 // Is the grouped GEMM actually usable for this call?
                 let grouped_available = !grouped_disabled
                     && matches!(a.dtype(), DType::BF16 | DType::F16)
@@ -3709,7 +3711,9 @@ impl QuantMethod for QtipLayer {
                             num_experts,
                         ),
                     };
-                let ondevice_disabled = std::env::var("ARC_NO_QTIP_ONDEVICE_MOE").is_ok();
+                // Read by VALUE: `ARC_NO_QTIP_ONDEVICE_MOE=0` leaves the
+                // on-device path enabled (the default).
+                let ondevice_disabled = crate::env_flag_is_set("ARC_NO_QTIP_ONDEVICE_MOE");
                 if !ondevice_disabled && use_ondevice {
                     // On-device ONLY, propagate its error. The host fallback
                     // (`gather_forward_cuda`) does a `to_vec1` D2H read of

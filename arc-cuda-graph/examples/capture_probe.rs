@@ -8,7 +8,7 @@
 fn main() -> candle_core::Result<()> {
     use arc_cuda_graph::CudaGraphRunner;
     use candle_core::{cuda::CudaDevice, DType, Device, Tensor};
-    use mistralrs_quant::{QtipLayer, QtipMode};
+    use mistralrs_quant::{env_flag_is_set, QtipLayer, QtipMode};
 
     let dev = Device::new_cuda_with_stream(0)?;
     let cd: &CudaDevice = match &dev {
@@ -16,7 +16,10 @@ fn main() -> candle_core::Result<()> {
         _ => unreachable!(),
     };
     cd.set_alloc_cache_enabled(true);
-    let deferred = std::env::var_os("ARC_NO_DEFERRED_FREE").is_none();
+    // Read by VALUE: `ARC_NO_DEFERRED_FREE=0` keeps deferred free on (the
+    // default). Under the presence test this replaced, it turned it off — so a
+    // probe run with `=0` as its control measured the recycling arm twice.
+    let deferred = !env_flag_is_set("ARC_NO_DEFERRED_FREE");
     println!("device created (stream, cache ON, deferred_free={deferred})");
 
     let (e, k, ntok, topk) = (8usize, 512usize, 1usize, 6usize);

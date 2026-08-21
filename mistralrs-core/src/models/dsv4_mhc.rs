@@ -742,7 +742,7 @@ pub(crate) fn sinkhorn_normalize(comb: &Tensor, sinkhorn_iters: usize, eps: f64)
     // pairwise-tree order, unfused IEEE _rn arithmetic, dedicated
     // no-fast-math build); see the contract comment there and the bitwise
     // replica tests in cuda/sinkhorn.rs.
-    if std::env::var_os("ARC_NO_FUSED_SINKHORN").is_none()
+    if !mistralrs_quant::env_flag_is_set("ARC_NO_FUSED_SINKHORN")
         && matches!(comb.device(), candle_core::Device::Cuda(_))
         && comb.dtype() == DType::F32
     {

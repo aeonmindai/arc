@@ -31,7 +31,9 @@ pub fn apply_immediate_isq(
         // layer is left stuck in the `Taken` state ("invalid transitional
         // state"). Synchronous quant completes - and surfaces errors -
         // deterministically at load, with bounded peak memory.
-        let force_sync = std::env::var_os("ARC_SYNC_ISQ").is_some();
+        //
+        // Read by VALUE: `ARC_SYNC_ISQ=0` means off. It used to mean on.
+        let force_sync = crate::env_flag_is_set("ARC_SYNC_ISQ");
         if let Some(pool) = params.pool.as_ref().filter(|_| !force_sync) {
             // Parallel path: spawn quantization on thread pool
             let guard = params.guard.clone();
@@ -103,7 +105,7 @@ pub(crate) fn apply_immediate_isq_always(
     }) = get_immediate_isq()
     {
         // See `apply_immediate_isq`: ARC_SYNC_ISQ forces inline quantization.
-        let force_sync = std::env::var_os("ARC_SYNC_ISQ").is_some();
+        let force_sync = crate::env_flag_is_set("ARC_SYNC_ISQ");
         if let Some(pool) = pool.as_ref().filter(|_| !force_sync) {
             let device = device.clone();
             let (tx, rx) = pending_layer::pending_isq_channel();

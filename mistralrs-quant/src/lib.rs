@@ -29,6 +29,7 @@ pub mod cublaslt;
 pub mod cuda_peer;
 pub mod distributed;
 mod dummy;
+pub mod env_flag;
 pub mod f8q8;
 mod fp8;
 pub mod gemv;
@@ -73,6 +74,7 @@ pub use calibration::{
     CALIB_COLLECTOR_VERSION, CALIB_EXTENSION, CALIB_FORMAT_VERSION,
 };
 pub use cuda_peer::{enable_peer_access, PeerAccessReport, PeerAccessStatus, PeerPair};
+pub use env_flag::{env_flag_is_set, env_flag_value};
 pub use distributed::{
     layers::{
         compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, ExpertSubset, FusedExperts,

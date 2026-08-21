@@ -914,7 +914,9 @@ pub fn fp8_blockwise_quantize(
 fn fp8_gemv_max_m() -> usize {
     use std::sync::LazyLock;
     static MAX_M: LazyLock<usize> = LazyLock::new(|| {
-        if std::env::var("ARC_NO_FP8_GEMV").is_ok() {
+        // Read by VALUE: `ARC_NO_FP8_GEMV=0` leaves the GEMV enabled. Under the
+        // presence test this replaced, it disabled it.
+        if crate::env_flag_is_set("ARC_NO_FP8_GEMV") {
             return 0;
         }
         std::env::var("ARC_FP8_GEMV_MAX_M")
@@ -1002,7 +1004,12 @@ fn fp8_gemv_max_m() -> usize {
 #[cfg(feature = "cuda")]
 fn fp8_wmma_enabled() -> bool {
     use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("ARC_NO_FP8_WMMA").is_err());
+    // Read by VALUE: `ARC_NO_FP8_WMMA=0` keeps the WMMA kernel (the default).
+    // Under the presence test this replaced, it silently selected the control
+    // arm — which is the arm this kernel's own docs tell you to run first, so
+    // an operator following them would have recorded the control twice.
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| !crate::env_flag_is_set("ARC_NO_FP8_WMMA"));
     *ENABLED
 }
 
