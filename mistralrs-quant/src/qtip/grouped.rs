@@ -109,11 +109,43 @@ pub fn grouped_variant() -> i32 {
     }
     let init = match std::env::var(QTIP_GROUPED_VARIANT_ENV) {
         Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "baseline" | "0" => QTIP_GROUPED_VARIANT_BASELINE,
             "tuned" | "1" => QTIP_GROUPED_VARIANT_TUNED,
             "ldst" | "2" => QTIP_GROUPED_VARIANT_LDST,
-            _ => QTIP_GROUPED_VARIANT_BASELINE,
+            // An unrecognised value used to fall through to the baseline. Now
+            // that the baseline is the SLOW arm rather than the default, a typo
+            // would silently cost ~20% of prefill, so say so and keep the
+            // default instead of quietly selecting the worst kernel.
+            other => {
+                tracing::warn!(
+                    "{QTIP_GROUPED_VARIANT_ENV}=`{other}` is not a known grouped-GEMM \
+                     variant (baseline|0, tuned|1, ldst|2); using the default."
+                );
+                QTIP_GROUPED_VARIANT_LDST
+            }
         },
-        Err(_) => QTIP_GROUPED_VARIANT_BASELINE,
+        // 🔴 The DEFAULT is the tuned kernel, not the baseline.
+        //
+        // This used to be `QTIP_GROUPED_VARIANT_BASELINE`, and nothing in the
+        // serving path ever calls `set_grouped_variant` -- its only callers are
+        // in `examples/qtip_grouped_curve.rs`. So every production prefill ran
+        // variant 0 and the tuned kernels were reachable only by setting an env
+        // var nobody sets. They are bit-identical in output and were already
+        // measured at +39.4% (v1) and +41.6% (v2) per m-tile.
+        //
+        // ✅ MEASURED END-TO-END 2026-08-20, H200, DeepSeek-V4-Flash qtip2b,
+        // pp2048 b=1, --no-paged-attn, arm proved from the runtime launch
+        // counters ([0,0,129] on v2 vs [129,0,0] on v0, i.e. 43 layers x 3
+        // matrices, and zero launches on the arms not under test):
+        //     variant 0: 561.7 prompt tok/s, 1.780 ms/prompt-token, TTFT 3.675 s
+        //     variant 2: 671.3 prompt tok/s, 1.490 ms/prompt-token, TTFT 3.080 s
+        //     => +19.5% prefill throughput, -16.2% TTFT.
+        // An engine-independent wall clock agrees (557.2 -> 664.9 tok/s, +19.3%).
+        //
+        // The end-to-end gain is smaller than the kernel gain because the gather
+        // is ~56% of a 2048-token prefill step, not 100% -- backing +41.6% on
+        // that share out of a measured +19.5% overall is consistent.
+        Err(_) => QTIP_GROUPED_VARIANT_LDST,
     };
     let _ = GROUPED_VARIANT.compare_exchange(
         GROUPED_VARIANT_UNINIT,

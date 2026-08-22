@@ -23,11 +23,13 @@
 
 #[allow(clippy::excessive_precision)]
 pub mod codebook;
+pub mod cuda_tables;
 pub mod generate;
 pub mod layout;
 pub mod wht;
 
 use codebook::Codebook;
+pub use cuda_tables::{cuda_supports_head_dim, TURBOQUANT_CUDA_HEAD_DIMS};
 pub use generate::{MAX_BLOCK_DIM, MIN_BLOCK_DIM};
 pub use layout::{block_plan, BlockSpec, TurboQuantLayout};
 use serde::{Deserialize, Serialize};

@@ -71,7 +71,14 @@ mistralrs-paged-attn = { workspace = true, optional = true }
 mistralrs-quant.workspace = true
 arc-turbo = { path = "../arc-turbo" }
 arc-profiler = { path = "../arc-profiler" }
-arc-cuda-graph = { path = "../arc-cuda-graph", optional = true, features = [] }
+# NOT optional, deliberately: the sequence-completion funnel
+# (`Sequence::set_state`) must stand the device decode loop down on every
+# finished transition, and a gate that only compiles under
+# `cfg(feature = "cuda")` cannot be tested on any machine that reviews it —
+# the exact class that let the cross-request token leak ship. The crate's
+# host-side surface (pending-token queue, burst driver, admission) is plain
+# Rust; the CUDA plumbing inside it stays behind its own `cuda` feature.
+arc-cuda-graph = { path = "../arc-cuda-graph", features = [] }
 uuid = { workspace = true, features = ["v4"] }
 utoipa = { workspace = true, optional = true }
 schemars.workspace = true
@@ -124,7 +131,6 @@ cuda = [
     "mistralrs-quant/cuda",
     "dep:mistralrs-paged-attn",
     "mistralrs-paged-attn/cuda",
-    "dep:arc-cuda-graph",
     "arc-cuda-graph/cuda",
     "arc-profiler/cuda",
 ]

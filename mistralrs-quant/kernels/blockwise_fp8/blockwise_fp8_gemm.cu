@@ -40,17 +40,54 @@ __device__ __forceinline__ float get_scale(const float *__restrict__ scale,
   return __ldg(&scale[sr * scale_stride + sc]);
 }
 
+// Shift variant of `get_scale`, for power-of-two scale-block sizes.
+//
+// `block_size_y`/`block_size_x` arrive as kernel ARGUMENTS, so `n /
+// block_size_y` above is `int / int` by a non-constant divisor. NVIDIA GPUs
+// have no integer-divide instruction; nvcc expands each division inline to a
+// reciprocal-multiply-and-fixup sequence of ~15-20 instructions, and
+// `fp8_matmul_tiled` pays TWO of them per weight element it stages into
+// shared memory. The shipped `weight_block_size` is [128, 128] — both powers
+// of two — so the host launcher computes `shift = log2(block_size)` once per
+// launch and the kernel indexes with two SHFs instead.
+//
+// Bit-identical: for non-negative `n` and a power-of-two divisor,
+// `n >> log2(d)` IS `n / d` — the same quotient for every input, no rounding
+// involved anywhere. The two paths read the same scale word; only the
+// instruction count changes. Non-power-of-two geometries keep the division
+// path above.
+__device__ __forceinline__ float get_scale_pow2(const float *__restrict__ scale,
+                                                int n, int k, int scale_stride,
+                                                int scale_shift_y,
+                                                int scale_shift_x) {
+  int sr = n >> scale_shift_y;
+  int sc = k >> scale_shift_x;
+  return __ldg(&scale[sr * scale_stride + sc]);
+}
+
 // ============================================================================
 // FP8 Matmul Kernel
 // ============================================================================
 
-template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
+// `POW2_SCALE` selects, at compile time, how the per-element weight scale is
+// indexed while staging the weight tile:
+//   * true  -> `get_scale_pow2`: two SHFs, using `scale_shift_y`/`scale_shift_x`
+//              (host-computed `log2(block_size_y)`/`log2(block_size_x)`).
+//   * false -> `get_scale`: two runtime integer divisions (the general path,
+//              kept for non-power-of-two scale geometries).
+// The two instantiations produce BIT-IDENTICAL output (`n >> log2(d) == n / d`
+// for the non-negative indices used here), so dispatching on it can never
+// change what a leg of an A/B measures — only how fast the scalar arm runs.
+// Both `block_size_*` and `scale_shift_*` are always passed; each
+// instantiation reads only its own pair.
+template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, bool POW2_SCALE>
 __global__ void fp8_matmul_tiled(const T *__restrict__ input,
                                  const __nv_fp8_e4m3 *__restrict__ weight,
                                  const float *__restrict__ weight_scale,
                                  T *__restrict__ output, int M, int N, int K,
                                  int scale_row_stride, int block_size_y,
-                                 int block_size_x) {
+                                 int block_size_x, int scale_shift_y,
+                                 int scale_shift_x) {
   // Padding is +1, not +4. The inner product reads `s_weight[tx][k]` with `tx`
   // varying fastest within a warp, so consecutive lanes are `BLOCK_K + pad`
   // floats apart. At BLOCK_K=32 a +4 pad gives stride 36; 36 mod 32 = 4, so
@@ -106,8 +143,14 @@ __global__ void fp8_matmul_tiled(const T *__restrict__ input,
       if (gn < N && gk < K) {
         __nv_fp8_e4m3 w;
         w.__x = __ldg(reinterpret_cast<const uint8_t *>(&weight[gn * K + gk]));
-        float s = get_scale(weight_scale, gn, gk, scale_row_stride,
-                            block_size_y, block_size_x);
+        float s;
+        if constexpr (POW2_SCALE) {
+          s = get_scale_pow2(weight_scale, gn, gk, scale_row_stride,
+                             scale_shift_y, scale_shift_x);
+        } else {
+          s = get_scale(weight_scale, gn, gk, scale_row_stride, block_size_y,
+                        block_size_x);
+        }
         val = fp8_to_float(w) * s;
       }
       s_weight[ln][lk] = val;
@@ -625,23 +668,56 @@ __global__ void fp8_moe_gemm(const T *__restrict__ input,
 // C API
 // ============================================================================
 
-extern "C" void launch_fp8_matmul_f16(const __half *input,
-                                      const __nv_fp8_e4m3 *weight,
-                                      const float *weight_scale, __half *output,
-                                      int M, int N, int K, int scale_row_stride,
-                                      int block_size_y, int block_size_x,
-                                      cudaStream_t stream) {
+// Host-side pow2 test + exact log2 for the tiled kernel's scale fast path.
+// Computed ONCE per launch, on the host, so the device never divides.
+static inline bool fp8_is_pow2(int v) { return v > 0 && (v & (v - 1)) == 0; }
+static inline int fp8_ilog2_exact(int v) {
+  int s = 0;
+  while ((1 << s) < v)
+    ++s;
+  return s; // caller guarantees fp8_is_pow2(v), so (1 << s) == v
+}
+
+// Shared launcher: picks the POW2_SCALE instantiation when BOTH scale-block
+// sizes are powers of two (the shipped geometry is [128, 128], so serving
+// always takes it), otherwise the general division path. The two
+// instantiations are bit-identical in output — see the kernel comment.
+template <typename T>
+static void launch_fp8_matmul_impl(const T *input, const __nv_fp8_e4m3 *weight,
+                                   const float *weight_scale, T *output, int M,
+                                   int N, int K, int scale_row_stride,
+                                   int block_size_y, int block_size_x,
+                                   cudaStream_t stream) {
   constexpr int TILE = 32;
   constexpr int TILE_K = 32;
 
   dim3 block(TILE, TILE);
   dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
 
-  fp8_gemm::fp8_matmul_tiled<half, TILE, TILE, TILE_K>
-      <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
-                                   scale_row_stride, block_size_y,
-                                   block_size_x);
+  if (fp8_is_pow2(block_size_y) && fp8_is_pow2(block_size_x)) {
+    fp8_gemm::fp8_matmul_tiled<T, TILE, TILE, TILE_K, true>
+        <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N,
+                                     K, scale_row_stride, block_size_y,
+                                     block_size_x, fp8_ilog2_exact(block_size_y),
+                                     fp8_ilog2_exact(block_size_x));
+  } else {
+    fp8_gemm::fp8_matmul_tiled<T, TILE, TILE, TILE_K, false>
+        <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N,
+                                     K, scale_row_stride, block_size_y,
+                                     block_size_x, 0, 0);
+  }
   CUDA_CHECK(cudaGetLastError());
+}
+
+extern "C" void launch_fp8_matmul_f16(const __half *input,
+                                      const __nv_fp8_e4m3 *weight,
+                                      const float *weight_scale, __half *output,
+                                      int M, int N, int K, int scale_row_stride,
+                                      int block_size_y, int block_size_x,
+                                      cudaStream_t stream) {
+  launch_fp8_matmul_impl<half>(input, weight, weight_scale, output, M, N, K,
+                               scale_row_stride, block_size_y, block_size_x,
+                               stream);
 }
 
 extern "C" void
@@ -649,17 +725,9 @@ launch_fp8_matmul_bf16(const __nv_bfloat16 *input, const __nv_fp8_e4m3 *weight,
                        const float *weight_scale, __nv_bfloat16 *output, int M,
                        int N, int K, int scale_row_stride, int block_size_y,
                        int block_size_x, cudaStream_t stream) {
-  constexpr int TILE = 32;
-  constexpr int TILE_K = 32;
-
-  dim3 block(TILE, TILE);
-  dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
-
-  fp8_gemm::fp8_matmul_tiled<__nv_bfloat16, TILE, TILE, TILE_K>
-      <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
-                                   scale_row_stride, block_size_y,
-                                   block_size_x);
-  CUDA_CHECK(cudaGetLastError());
+  launch_fp8_matmul_impl<__nv_bfloat16>(input, weight, weight_scale, output, M,
+                                        N, K, scale_row_stride, block_size_y,
+                                        block_size_x, stream);
 }
 
 // Warp-per-row GEMV launcher for the decode regime (M <= 4). Row-grouping

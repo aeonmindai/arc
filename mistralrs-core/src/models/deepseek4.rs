@@ -1287,9 +1287,21 @@ impl Attention {
         if cos.dtype() != candle_core::DType::BF16 || sin.dtype() != candle_core::DType::BF16 {
             decline!("RoPE tables are not BF16");
         }
-        if seqlen_offsets.len() != 1 {
+        // The kernel needs ONE `pos_offset`, not a batch of one row. It reads
+        // the table at `pos_offset + t` where `t = blockIdx.y % seq_len`
+        // (`qk_norm_rope.cu`), a position that does not depend on `b`, and its
+        // grid is `(n_heads + 1, batch * seq_len)` with buffers sized
+        // `batch * ...` — so it is already correct at any batch size whose rows
+        // share an offset. This used to read `seqlen_offsets.len() != 1`, which
+        // tested the length of the vector rather than the distinctness of its
+        // values and therefore declined at EVERY batch size above one, leaving
+        // the fused path dead in exactly the serving regime it was written for.
+        // Rows that genuinely differ still decline, and still take the eager
+        // chain. Prove the swap with `ARC_QK_VERIFY=1`, which bit-compares
+        // against the eager output at every layer.
+        let Some(uniform_offset) = crate::layers::uniform_seqlen_offset(seqlen_offsets) else {
             decline!("per-sequence position offsets");
-        }
+        };
         if self.num_kv_heads != 1 {
             decline!("more than one KV head");
         }
@@ -1318,11 +1330,21 @@ impl Attention {
         if qh != self.num_attention_heads * head_dim {
             decline!("q_proj output width is not n_heads * head_dim");
         }
+        // The batched cohort is OPT-IN. Fixing the length-vs-values gate above
+        // makes this kernel live on a path it has never run on, and this repo
+        // has paid for exactly that twice this week (TCFRAG, and the fused-512
+        // attention path that dropped the mask for four days). `batch == 1` is
+        // untouched — already live, already exercised. See
+        // `qk::fused_cohort_enabled` for the doctrine and for how to turn the
+        // cohort path on once it has been measured on hardware.
+        if qb > 1 && !qk::fused_cohort_enabled() {
+            decline!("batched cohort disabled by ARC_QK_FUSED_COHORT=0 (default is ON since s10)");
+        }
         match kv_normed.dims3() {
             Ok((kb, kt, kh)) if kb == qb && kt == qt && kh == head_dim => {}
             _ => decline!("kv_norm output shape does not match [B, T, head_dim]"),
         }
-        let pos_offset = seqlen_offsets[0];
+        let pos_offset = uniform_offset;
         match cos.dims2() {
             Ok((rows, cols)) if cols == rope_dim / 2 && rows >= pos_offset + qt => {}
             _ => decline!("RoPE table does not cover [pos_offset, pos_offset + T)"),
@@ -1969,8 +1991,8 @@ impl Attention {
                 graph_attn
             }
             None => {
-                // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
-                // the dense BF16 K the model has always stored.
+                // FP8 code storage is default-ON since s10 (`ARC_V4_FP8_KV=0`
+                // restores the dense BF16 K layout).
                 let cached = {
                     let _s = arc_profiler::device_span("kv_cache_append");
                     append_kv_mqa(
@@ -3137,16 +3159,21 @@ fn append_graph_kv_mqa(
     Ok(k_full)
 }
 
-/// FP8 storage for the cached K. **Opt-in: off unless `ARC_V4_FP8_KV=1`.**
+/// FP8 storage for the cached K. **Default ON since the s10 GPU A/B;
+/// `ARC_V4_FP8_KV=0` restores the BF16 layout.**
 ///
 /// wave43-BU shipped this defaulted ON without ever running it on a GPU — its
 /// own notes said *"needs a GPU: first CUDA exercise of a U8 `SingleCache`"* —
 /// and the first V4 forward on a commit that contained it died, every request,
 /// with `dtype mismatch in slice-set, lhs: BF16, rhs: U8` (wave48-BY). The
 /// layout is sound and bit-exact (see [`super::dsv4_kv_fp8`]); what was never
-/// exercised is the CUDA leg of it. Until a GPU A/B has shown
-/// `ARC_V4_FP8_KV=1` and unset producing token-identical greedy output, the
-/// default is the layout that has actually served (wave49-BZ).
+/// exercised was the CUDA leg. That A/B has now run: s10 leg 10 (box
+/// `arc-s10-ledger`, H200, candidate `4d03b9e25`) — seeded canaries
+/// byte-identical to the BF16 arm, b=1 41.49 vs 40.76 tok/s (not slower), and
+/// engagement PROVEN by nsys kernel capture (`arc_kv_fp8_quantize_kernel`
+/// 16,297 launches, `arc_kv_fp8_dequantize_kernel` 32,594 in one b=1 run —
+/// the U8 CUDA leg genuinely executed). This is the difference from wave43:
+/// the same default, now standing on a measurement instead of a hope.
 ///
 /// Also forced off under `ARC_V4_CAPTURE_PROBE`: the CUDA-graph decode arm
 /// writes through `mistralrs_quant::kvwrite::write_kv_inplace`, which is
@@ -3206,7 +3233,10 @@ fn v4_fp8_kv_enabled() -> bool {
 /// about the default, which is exactly the kind of test DOCTRINE D12 counts as
 /// worse than none.
 fn fp8_kv_enabled_from(var: Option<&str>, capture_probe: bool) -> bool {
-    var == Some("1") && !capture_probe
+    // Default ON since s10 (measured; see the doc above). The capture-probe
+    // veto is unconditional: write_kv_inplace has no U8 arm, so the graph
+    // decode path and the U8 cache remain mutually exclusive.
+    var != Some("0") && !capture_probe
 }
 
 /// RUN-161 decode profiler. Enabled by `ARC_TIME_DECODE=1`. Accumulates
@@ -5902,17 +5932,27 @@ mod kv_footprint_tests {
     /// purpose: the latter is a `OnceLock`, so a test that set the variable
     /// would resolve it once and prove nothing about the default.
     #[test]
-    fn v4_fp8_kv_is_opt_in() {
-        assert!(!fp8_kv_enabled_from(None, false), "unset must be OFF");
-        assert!(!fp8_kv_enabled_from(Some("0"), false));
-        assert!(!fp8_kv_enabled_from(Some(""), false));
-        assert!(!fp8_kv_enabled_from(Some("true"), false));
-        assert!(!fp8_kv_enabled_from(Some("on"), false));
-        assert!(!fp8_kv_enabled_from(Some("2"), false));
+    fn v4_fp8_kv_is_default_on_with_a_literal_zero_kill_switch() {
+        assert!(
+            fp8_kv_enabled_from(None, false),
+            "unset must be ON — measured s10 leg 10 (arc-s10-ledger, 4d03b9e25): \
+             canaries byte-identical, engagement proven by nsys kernel capture"
+        );
+        assert!(!fp8_kv_enabled_from(Some("0"), false), "\"0\" is the kill switch");
+        assert!(fp8_kv_enabled_from(Some(""), false));
+        assert!(fp8_kv_enabled_from(Some("true"), false));
+        assert!(fp8_kv_enabled_from(Some("on"), false));
+        assert!(fp8_kv_enabled_from(Some("2"), false));
         assert!(fp8_kv_enabled_from(Some("1"), false), "=1 must be ON");
         assert!(
             !fp8_kv_enabled_from(Some("1"), true),
             "ARC_V4_CAPTURE_PROBE must veto it: write_kv_inplace has no U8 arm"
+        );
+        assert!(
+            !fp8_kv_enabled_from(None, true),
+            "the veto must hold for the DEFAULT too, not just for explicit =1 — \
+             the capture probe cannot write a U8 cache regardless of how FP8 KV \
+             was selected"
         );
     }
 
@@ -5957,6 +5997,9 @@ mod kv_footprint_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests drive the pin override; importing it at module scope made
+    // it an unused import on every non-test build.
+    use crate::kv_cache::xs_rolling;
 
     /// The **verbatim** `config.json` published at
     /// <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/config.json>
@@ -8149,6 +8192,156 @@ mod tests {
         ragged_batch_matches_b1(128, &[129, 143, 1024, 1150], 3)
     }
 
+    /// 🔑 Settles the one discrepancy between two independent models of this
+    /// buffer, and does it without a GPU.
+    ///
+    /// The ArcGraph chain measured the reallocation cycling through
+    /// `4096 x {18, 19, 20, 21}`. Running the retention rule forward predicts
+    /// `{20, 21, 22, 23}`. Both are `ratio`-consecutive, both contain 21, and
+    /// they are offset by exactly 2 — so one of the two models is wrong about
+    /// *why*, even though the bound holds either way.
+    ///
+    /// The pre-committed reconciliation was: theirs is the pre-saturation RAMP
+    /// (their run generated ~21 tokens, so `base` had not finished advancing
+    /// and `W = tokens - base` was still climbing), mine is the steady state.
+    /// This checks that claim directly by recording the width from token 1,
+    /// and it is the difference between a bound that is right for the right
+    /// reason and one that happens to be right — which is the trap the next
+    /// context length springs.
+    #[test]
+    fn the_window_ramps_then_settles_to_ratio_consecutive_sizes() -> Result<()> {
+        xs_rolling::pin_test_override::with(false, || {
+            let device = Device::Cpu;
+            let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+            let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+            let stream = per_row_streams(1, 130, hidden, &device)?.remove(0);
+            let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+
+            let mut widths = Vec::new();
+            for i in 0..128 {
+                s.advance(&stream.narrow(1, i, 1)?, |w| compressor.forward_from_xs(w))?;
+                widths.push(s.tail_width()?);
+            }
+            let cap = ratio * compressor.coff + crate::kv_cache::XS_TAIL_MARGIN_TOKENS;
+
+            // The ramp: early widths are BELOW the steady-state band, because
+            // `base` is still pinned at 0 while `tokens` climbs.
+            let ramp: std::collections::BTreeSet<_> = widths[..20].iter().copied().collect();
+            let steady: std::collections::BTreeSet<_> = widths[64..].iter().copied().collect();
+            assert!(
+                ramp.iter().min() < steady.iter().min(),
+                "the early widths must be a ramp, not the steady band: ramp {ramp:?} \
+                 steady {steady:?}"
+            );
+            // The steady state is exactly `ratio` consecutive sizes…
+            assert_eq!(
+                steady.len(),
+                ratio,
+                "steady-state width must cycle through exactly `ratio` sizes, got {steady:?}"
+            );
+            let lo = *steady.iter().next().unwrap();
+            assert_eq!(
+                steady.iter().copied().collect::<Vec<_>>(),
+                (lo..lo + ratio).collect::<Vec<_>>(),
+                "the steady band must be consecutive, got {steady:?}"
+            );
+            // …and it is the top of the range the bound allows: [cap-ratio, cap).
+            assert_eq!(
+                (lo, lo + ratio - 1),
+                (cap - ratio, cap - 1),
+                "steady band should be [cap-ratio, cap-1] = [{}, {}]",
+                cap - ratio,
+                cap - 1
+            );
+            // The bound, over every step including the ramp.
+            assert!(
+                widths.iter().all(|&w| w < cap),
+                "some width reached the pinned capacity {cap}, so pinning there could truncate: \
+                 max was {:?}",
+                widths.iter().max()
+            );
+            Ok(())
+        })
+    }
+
+    /// 🔑 Pinning the retained window must change the ALLOCATION and nothing
+    /// else. This is the evidence that the pin is SAFE — the two settings are
+    /// run against the same stream for 40 steps and required to agree EXACTLY,
+    /// on the compressed rows and on both time bases.
+    ///
+    /// It was once also offered as the evidence for defaulting
+    /// `ARC_V4_XS_PIN_WINDOW` on without a throughput number. It is not that:
+    /// it proves the pin changes no answer, which is necessary and not
+    /// sufficient. The flag is opt-in until the throughput number exists on
+    /// this tree — see `xs_rolling::xs_pin_window_enabled_from`'s FLIP
+    /// CONDITION for the experiment that settles it.
+    ///
+    /// The argument for why they must — every offset is derived from the row's
+    /// own token count, so a wider buffer shifts `off` by exactly the widening
+    /// and the compressor sees the same absolute tokens — is the kind of
+    /// argument that has been wrong on this chain before. So it is checked.
+    #[test]
+    fn pinning_the_window_is_numerically_inert() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+        let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+        let stream = per_row_streams(1, 220, hidden, &device)?.remove(0);
+
+        let run = |pinned: bool| -> Result<(Tensor, Vec<usize>, Vec<usize>, Vec<usize>)> {
+            xs_rolling::pin_test_override::with(pinned, || {
+                let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+                s.advance(&stream.narrow(1, 0, 37)?, |w| compressor.forward_from_xs(w))?;
+                let mut widths = Vec::new();
+                for i in 0..40 {
+                    s.advance(&stream.narrow(1, 37 + i, 1)?, |w| {
+                        compressor.forward_from_xs(w)
+                    })?;
+                    widths.push(s.tail_width()?);
+                }
+                let comp = s.compressed_rows()?.expect("past one full group");
+                let (tok, base) = s.row_lens();
+                Ok((comp, tok.to_vec(), base.to_vec(), widths))
+            })
+        };
+
+        let (comp_off, tok_off, base_off, widths_off) = run(false)?;
+        let (comp_on, tok_on, base_on, widths_on) = run(true)?;
+
+        assert_eq!(
+            max_abs_diff(&comp_off, &comp_on)?,
+            0.0,
+            "pinning the window changed the compressed rows — it must only change the allocation"
+        );
+        assert_eq!(tok_off, tok_on, "token counts diverged");
+        assert_eq!(base_off, base_on, "resume points diverged");
+
+        // …and the fixture must actually exercise the difference, or the
+        // equality above proves nothing (five fixtures on this chain have
+        // survived a mutation by not distinguishing the two answers).
+        let distinct_off: std::collections::BTreeSet<_> = widths_off.iter().collect();
+        assert!(
+            distinct_off.len() > 1,
+            "unpinned widths did not vary ({widths_off:?}), so this proves nothing about pinning"
+        );
+        assert_eq!(
+            distinct_off.len(),
+            ratio,
+            "unpinned width should cycle through `ratio` consecutive sizes, got {distinct_off:?}"
+        );
+        let cap = ratio * compressor.coff + crate::kv_cache::XS_TAIL_MARGIN_TOKENS;
+        assert!(
+            widths_on.iter().all(|&w| w == cap),
+            "pinned widths must be the constant {cap}, got {widths_on:?}"
+        );
+        // The bound the pin rests on: the unpinned width never reaches it.
+        assert!(
+            widths_off.iter().all(|&w| w < cap),
+            "the pinned capacity {cap} must exceed every width the retention rule produces, \
+             got {widths_off:?}"
+        );
+        Ok(())
+    }
+
     /// The control the ragged tests need: a UNIFORM batch takes the untouched
     /// scalar path and is also token-identical. If this ever failed, the
     /// "flag off is byte-identical" claim would be false and the ragged
@@ -8297,8 +8490,73 @@ mod tests {
     /// the per-sequence invariant `window width == tokens - base`, taking that
     /// row's share from the END of the shared window. Taking it from the front
     /// would hand the row somebody else's older tokens under its own `base`.
+    /// ⚠️ Run with the window pin OFF, deliberately. Its premise is a row
+    /// *narrower* than the shared window, which is what a resizing buffer
+    /// produces; pinned, every row is the same width and the premise — and the
+    /// re-anchoring it checks — cannot be constructed. The re-anchoring still
+    /// has to be right when the pin is off, and
+    /// `splitting_a_pinned_row_keeps_the_buffer_and_the_resume_point` covers
+    /// the pinned side, where the requirement is the opposite one.
     #[test]
     fn splitting_a_batched_row_restores_the_per_sequence_window() -> Result<()> {
+        xs_rolling::pin_test_override::with(false, splitting_a_batched_row_inner)
+    }
+
+    /// 🔑 The pinned counterpart, and the reason it matters is cost, not
+    /// correctness: `clone_out_cache` calls `split_row` once per layer per
+    /// sequence on EVERY engine step. A split that re-narrowed to
+    /// `tokens - base` would reallocate the buffer every step and undo the pin
+    /// precisely on the hot path it exists for. So the split must hand back the
+    /// SAME tensor, and must not move the row's resume point while doing it.
+    #[test]
+    fn splitting_a_pinned_row_keeps_the_buffer_and_the_resume_point() -> Result<()> {
+        xs_rolling::pin_test_override::with(true, || {
+            let device = Device::Cpu;
+            let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
+            let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;
+            let lens = [37usize, 40];
+            let streams = per_row_streams(2, 64, hidden, &device)?;
+            let mut refs: Vec<XsRollingCache> = Vec::new();
+            for (i, &l) in lens.iter().enumerate() {
+                let mut s = XsRollingCache::new(ratio, compressor.coff, head_dim, 4096);
+                s.advance(&streams[i].narrow(1, 0, l)?, |w| {
+                    compressor.forward_from_xs(w)
+                })?;
+                refs.push(s);
+            }
+            let cap = ratio * compressor.coff + crate::kv_cache::XS_TAIL_MARGIN_TOKENS;
+            for r in &refs {
+                assert_eq!(
+                    r.tail.as_ref().unwrap().dim(1)?,
+                    cap,
+                    "a pinned per-sequence window must already be the capacity"
+                );
+            }
+            let batched = batch_xs(&refs)?;
+            let shared = batched.tail.as_ref().unwrap().dim(1)?;
+            assert_eq!(shared, cap, "pinned rows batch without any padding at all");
+
+            let comps = batched.comp.all_data.as_ref().unwrap().chunk(2, 0)?;
+            let tails = batched.tail.as_ref().unwrap().chunk(2, 0)?;
+            for i in 0..2 {
+                let out = batched.split_row(i, comps[i].clone(), tails[i].clone())?;
+                assert_eq!(
+                    out.tail.as_ref().unwrap().dim(1)?,
+                    cap,
+                    "row {i}: the split re-narrowed a pinned buffer, which would reallocate it \
+                     on every engine step"
+                );
+                assert_eq!(
+                    (out.row_lens().0[0], out.row_lens().1[0]),
+                    (refs[i].row_lens().0[0], refs[i].row_lens().1[0]),
+                    "row {i}: keeping the buffer must not move the resume point"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn splitting_a_batched_row_inner() -> Result<()> {
         let device = Device::Cpu;
         let (hidden, head_dim, ratio) = (32usize, 16usize, 4usize);
         let compressor = rolling_test_compressor(ratio, hidden, head_dim, &device)?;

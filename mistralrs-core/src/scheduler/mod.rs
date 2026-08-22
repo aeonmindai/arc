@@ -1,7 +1,9 @@
+pub mod bucket_telemetry;
 mod default_scheduler;
 
 use std::sync::Arc;
 
+pub use bucket_telemetry::{sched_bucket_marker, sched_buckets, SchedBuckets};
 pub use default_scheduler::{DefaultScheduler, DefaultSchedulerMethod, DefaultSchedulerOutput};
 use tokio::sync::Mutex;
 

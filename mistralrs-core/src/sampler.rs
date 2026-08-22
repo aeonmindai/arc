@@ -300,6 +300,8 @@ fn cmp_desc_by_prob(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
 /// If `k >= probs.len()`, returns all elements sorted.
 /// Also zeros out elements in `probs` beyond top-k if `zero_rest` is true.
 fn partial_sort_top_k(probs: &mut [f32], k: usize, zero_rest: bool) -> Vec<(u32, f32)> {
+    #[cfg(test)]
+    PARTIAL_SORT_CALLS.with(|calls| calls.set(calls.get() + 1));
     let n = probs.len();
     if n == 0 || k == 0 {
         return Vec::new();
@@ -331,6 +333,18 @@ fn partial_sort_top_k(probs: &mut [f32], k: usize, zero_rest: bool) -> Vec<(u32,
     idx_probs.sort_unstable_by(cmp_desc_by_prob);
 
     idx_probs
+}
+
+/// Invocation counter for [`partial_sort_top_k`], test builds only. Exists so
+/// the sort-skip in [`Sampler::sample_top_kp_min_p`] is provable: a test can
+/// assert the sort genuinely did not run, not merely that the output looks
+/// the same. Thread-local, because `cargo test` runs tests concurrently and
+/// several other tests in this file sort — a process-global counter would make
+/// every delta assertion racy.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARTIAL_SORT_CALLS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Kernel dispatch sizes for the GPU radix top-k sampler path. Must mirror
@@ -499,10 +513,41 @@ impl Sampler {
     /// directly. Two copies of this expression could disagree, and the one that
     /// disagreed would be a silent correctness bug rather than a slow path.
     fn has_penalties(&self) -> bool {
+        // DRY counts only when it can actually rewrite a logit. The disabled
+        // default (`DrySamplingParams::default()`) is `multiplier: 0.0`, and
+        // `apply_dry_penalty` returns without touching the logits when the
+        // multiplier is exactly 0.0 — so `dry_params.is_some()` alone was
+        // disqualifying the GPU fast path (and failing `is_raw_argmax`) for a
+        // penalty that is a proven no-op.
         self.frequency_penalty.unwrap_or(0.0) != 0.0
             || self.presence_penalty.unwrap_or(0.0) != 0.0
             || self.repetition_penalty.unwrap_or(1.0) != 1.0
-            || self.dry_params.is_some()
+            || self
+                .dry_params
+                .as_ref()
+                .is_some_and(|params| params.multiplier != 0.0)
+    }
+
+    /// Would [`Sampler::sample`] take the pure-argmax path — no temperature and
+    /// nothing that has to touch the logits on the host?
+    ///
+    /// This is the exact precondition for ArcGraph's device decode loop to
+    /// substitute its on-device argmax for the host one
+    /// (`pipeline/sampling.rs`). It deliberately mirrors the conditions inside
+    /// `sample` rather than approximating them: `logits_bias` and `top_nsigma`
+    /// are applied *before* the `trivial` gate, so a sampler carrying either
+    /// still needs the host even though the gate itself ignores them.
+    ///
+    /// Greedy is also the only mode where device and host agree *exactly* — the
+    /// device sampler runs Splitmix64 per row against the host's Isaac64, so
+    /// any stochastic mode would draw a different, equally valid token and
+    /// silently break seeded reproducibility.
+    pub fn is_greedy_trivial(&self) -> bool {
+        self.temperature.is_none()
+            && self.logits_processors.is_empty()
+            && !self.has_penalties()
+            && self.logits_bias.is_none()
+            && self.top_nsigma.is_none()
     }
 
     /// True when this sampler is exactly `argmax` over the model's **raw**
@@ -537,6 +582,69 @@ impl Sampler {
             && !self.has_penalties()
             && !self.has_logits_bias()
             && self.logits_processors.is_empty()
+    }
+
+    /// Mirror of [`Self::sample`]'s device fast-path dispatch, answerable
+    /// **before** the logits row has been copied anywhere: would a non-CPU row
+    /// of `vocab` logits be sampled to completion on the device (token-sized
+    /// D2H), rather than falling back to the CPU pipeline (full-row D2H +
+    /// full-vocab host work)?
+    ///
+    /// This is what `ARC_SAMPLE_ON_DEVICE`'s host-copy partitioning
+    /// (`pipeline/mod.rs`) consults per sequence: rows answering `true` keep
+    /// their device residency; rows answering `false` are gathered into ONE
+    /// batched D2H. It must stay in this file, next to the gates it mirrors
+    /// ([`Self::has_penalties`] and `sample`'s `trivial` condition): a second
+    /// copy that drifted would silently route rows onto the wrong side of the
+    /// PCIe bus.
+    ///
+    /// Assumes non-speculative sampling (`sample_speculative = false`), which
+    /// is what every `sample_causal_gen` reachable from the partitioned step
+    /// arm passes; the speculative pipelines override `step` entirely and
+    /// never see the partition.
+    ///
+    /// `logit_bias` and top-nσ do **not** disqualify: both are applied as
+    /// device tensor ops before the fast-path dispatch. One residual runtime
+    /// fallback remains on the CUDA radix path (a pure-top-p nucleus the
+    /// candidate set cannot contain declines with `Ok(None)`); it pays a
+    /// per-row D2H and is counted by `gpu_sampling_health::DECLINED`.
+    pub(crate) fn device_sampling_terminates(
+        &self,
+        vocab: usize,
+        device_is_cuda: bool,
+        return_logprobs: bool,
+    ) -> bool {
+        // `sample`'s `trivial` gate, minus its device term — the caller is
+        // deciding device residency, not reacting to it.
+        let trivial =
+            !return_logprobs && self.logits_processors.is_empty() && !self.has_penalties();
+        if !trivial {
+            return false;
+        }
+        // Greedy: a single argmax kernel + 4-byte D2H. Any backend, any vocab.
+        if self.temperature.is_none() {
+            return true;
+        }
+        // Temperature path: `sample_fast` stays on device when no sort is
+        // needed, or when candle's shared-memory arg_sort can hold the vocab
+        // (same bound `sample` checks).
+        let needs_sort = self.top_k > 0 || (self.top_p > 0.0 && self.top_p < 1.0);
+        if !needs_sort {
+            return true;
+        }
+        if vocab.next_power_of_two().saturating_mul(4) <= 48 * 1024 {
+            return true;
+        }
+        // Big-vocab sort: only the CUDA radix top-k path avoids the CPU
+        // fallback, and only when the requested k fits its dispatch table
+        // (`sample_fast_topk_gpu`'s own static precondition).
+        let max_k = *GPU_RADIX_TOPK_SIZES.last().unwrap();
+        let k_needed = if self.top_k > 0 {
+            self.top_k as usize
+        } else {
+            max_k
+        };
+        cfg!(feature = "cuda") && device_is_cuda && k_needed <= max_k && vocab > max_k
     }
 
     /// True if an OpenAI `logit_bias` map is set. Any sampling path that does
@@ -1164,8 +1272,17 @@ impl Sampler {
     ) -> Result<Logprobs> {
         let distr = WeightedIndex::new(probs).map_err(Error::wrap)?;
 
-        let mut mut_ref_rng = &mut *rng.lock().expect("could not lock rng mutex");
-        let next_token = distr.sample(&mut mut_ref_rng); // "Find the first item which has a weight *higher* than the chosen weight."
+        // Hold the global rng mutex for the draw and NOTHING else. The guard
+        // used to live to the end of this function (temporary lifetime
+        // extension through the `&mut *lock()` borrow), which serialised every
+        // concurrently-sampling sequence in the batch behind this one's
+        // `get_top_logprobs` (a partial sort plus up to `top_n` tokenizer
+        // decodes) and its own `tokenizer.decode` — none of which touch the
+        // rng.
+        let next_token = {
+            let mut guard = rng.lock().expect("could not lock rng mutex");
+            distr.sample(&mut *guard) // "Find the first item which has a weight *higher* than the chosen weight."
+        };
         let logprob = probs[next_token].log(10.0);
 
         let top_logprobs = if return_logprobs {
@@ -1208,6 +1325,22 @@ impl Sampler {
         } else {
             probs.len()
         };
+
+        // The sorted pairs feed exactly three consumers: the zero-rest pass
+        // inside `partial_sort_top_k` (only when `k < n`), the top-p cumsum
+        // walk, and the min-p threshold scan. Under the server defaults
+        // (`top_k = -1`, `top_p = 1.0`, `min_p = 0.0` — `engine/add_request.rs`)
+        // none of the three runs: `k = n` zeroes nothing, and both filter
+        // blocks below are gated out of (0, 1). That request was still paying
+        // a full-vocab `sort_unstable_by` — 129,280 elements for V4, per
+        // sequence per token — to produce a Vec nothing read. Skip straight to
+        // the multinomial draw; `probs` is untouched either way, so the drawn
+        // token (same rng stream) and the reported logprobs are identical.
+        let top_p_active = top_p > 0.0 && top_p < 1.0;
+        let min_p_active = min_p > 0.0 && min_p < 1.0;
+        if k >= probs.len() && !top_p_active && !min_p_active {
+            return self.sample_multinomial(probs, return_logprobs, rng);
+        }
 
         // Get sorted top-k indices with partial sort, zeroing out rest
         let idx_probs = partial_sort_top_k(probs, k, true);
@@ -2868,6 +3001,362 @@ mod topk_parity_tests {
                 "an active repetition penalty must still suppress the seen token"
             );
         }
+    }
+}
+
+/// The server-default sort skip and the penalty/eligibility gates.
+#[cfg(test)]
+mod fast_path_gate_tests {
+    use super::{DrySamplingParams, Sampler, PARTIAL_SORT_CALLS};
+    use candle_core::{Device, Tensor};
+    use rand::SeedableRng;
+    use rand_isaac::Isaac64Rng;
+    use std::sync::{Arc, Mutex};
+
+    const VOCAB: usize = 512;
+
+    /// Deterministic spread-out logits (same LCG family as the parity tests).
+    fn logits() -> Tensor {
+        let mut state: u64 = 0x5EED ^ 0xDEAD_BEEF_CAFE_F00D;
+        let v: Vec<f32> = (0..VOCAB)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 32) as u32 as f32 / u32::MAX as f32) * 12.0 - 6.0
+            })
+            .collect();
+        Tensor::from_vec(v, VOCAB, &Device::Cpu).unwrap()
+    }
+
+    fn sampler(top_k: i64, top_p: f64, min_p: f64) -> Sampler {
+        Sampler::new(
+            Some(0.7),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            top_k,
+            top_p,
+            min_p,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Sampled token + how many times `partial_sort_top_k` ran during the
+    /// call. `Sampler::sample` on this thread never crosses threads, so the
+    /// thread-local delta is exact.
+    fn sample_counting_sorts(s: &Sampler, seed: u64) -> (u32, u64) {
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(seed)));
+        let before = PARTIAL_SORT_CALLS.with(|c| c.get());
+        let token = s
+            .sample(logits(), &[1u32, 2, 3], false, rng, false, true)
+            .unwrap()
+            .token;
+        let sorts = PARTIAL_SORT_CALLS.with(|c| c.get()) - before;
+        (token, sorts)
+    }
+
+    /// The server defaults (`top_k = -1`, `top_p = 1.0`, `min_p = 0.0` —
+    /// `engine/add_request.rs`) must not run the full-vocab sort: nothing
+    /// consumes it. Equivalence witness: the PRE-FIX code path replicated
+    /// literally — `partial_sort_top_k(probs, n, zero_rest=true)` (which for
+    /// `k = n` sorts everything and zeroes nothing) followed by
+    /// `sample_multinomial` on the same rng seed. Same token, one sort vs
+    /// zero. (`top_k = VOCAB` is not a usable witness: it now — correctly —
+    /// takes the skip as well, being the same no-op filter.)
+    #[test]
+    fn server_default_top_k_skips_the_unconsumed_sort() {
+        let s = sampler(-1, 1.0, 0.0);
+        let (token_skip, sorts_skip) = sample_counting_sorts(&s, 42);
+        assert_eq!(sorts_skip, 0, "server defaults must skip the sort entirely");
+
+        // Pre-fix path, spelled out: softmax(logits / T), full sort with
+        // zero-rest, multinomial. Filters are all out of range, so the sort's
+        // output feeds nothing — exactly the work the skip removes.
+        let probs_t =
+            candle_nn::ops::softmax_last_dim(&(logits().to_dtype(candle_core::DType::F32).unwrap()
+                / 0.7)
+                .unwrap())
+            .unwrap();
+        let mut probs: Vec<f32> = probs_t.to_vec1().unwrap();
+        let n = probs.len();
+        let before = PARTIAL_SORT_CALLS.with(|c| c.get());
+        let sorted = super::partial_sort_top_k(&mut probs, n, true);
+        assert_eq!(
+            PARTIAL_SORT_CALLS.with(|c| c.get()) - before,
+            1,
+            "the witness must actually sort, or this test proves nothing"
+        );
+        assert_eq!(sorted.len(), VOCAB, "k = n returns every element sorted");
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+        let token_sort = s.sample_multinomial(&probs, false, rng).unwrap().token;
+
+        assert_eq!(
+            token_skip, token_sort,
+            "skipping the sort must not change the drawn token (identical probs, \
+             identical rng stream)"
+        );
+        // Pin the drawn token so a silent change to the rng stream (e.g. an
+        // extra draw before the multinomial) cannot pass as parity.
+        assert_eq!(token_skip, 506, "seeded draw moved — the rng stream shifted");
+    }
+
+    /// MUTATION CONTROLS for the skip condition: each filter that consumes the
+    /// sorted pairs must, on its own, keep the sort alive.
+    #[test]
+    fn each_active_filter_keeps_the_sort_alive() {
+        // top_p in (0,1): the cumsum walk needs the sorted pairs.
+        let (_, sorts) = sample_counting_sorts(&sampler(-1, 0.9, 0.0), 7);
+        assert_eq!(sorts, 1, "active top_p must sort");
+        // min_p in (0,1): the threshold scan needs the sorted pairs.
+        let (_, sorts) = sample_counting_sorts(&sampler(-1, 1.0, 0.1), 7);
+        assert_eq!(sorts, 1, "active min_p must sort");
+        // top_k < vocab: the zero-rest pass needs the partition.
+        let (_, sorts) = sample_counting_sorts(&sampler(32, 1.0, 0.0), 7);
+        assert_eq!(sorts, 1, "truncating top_k must sort");
+    }
+
+    /// A DRY config left at its disabled default (`multiplier: 0.0`) is a
+    /// proven no-op in `apply_dry_penalty`, so it must not count as a penalty
+    /// — before this fix `has_penalties()` answered true for it, which
+    /// disqualified the GPU fast path (and `is_raw_argmax`) for every request
+    /// that merely *carried* the default DRY struct.
+    ///
+    /// `is_raw_argmax` is the public reader of `has_penalties`; both
+    /// directions are pinned: disabled DRY ⇒ still raw-argmax, enabled DRY ⇒
+    /// not.
+    #[test]
+    fn disabled_dry_is_not_a_penalty_and_enabled_dry_is() {
+        // Dry params only survive `Sampler::new` when a tokenizer is present.
+        let tokenizer = Arc::new(tokenizers::Tokenizer::new(
+            tokenizers::models::bpe::BPE::default(),
+        ));
+        let mk = |dry: Option<DrySamplingParams>| {
+            Sampler::new(
+                None,
+                0,
+                Some(tokenizer.clone()),
+                None,
+                None,
+                None,
+                dry,
+                -1,
+                1.0,
+                0.0,
+                None,
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+
+        let none = mk(None);
+        assert!(none.is_raw_argmax(), "baseline: no DRY at all");
+
+        let disabled = mk(Some(DrySamplingParams::default()));
+        assert!(
+            disabled.is_raw_argmax(),
+            "multiplier = 0.0 (the disabled default) cannot rewrite a logit; \
+             it must not disqualify the fast path"
+        );
+
+        let enabled = mk(Some(DrySamplingParams {
+            multiplier: 0.8,
+            ..Default::default()
+        }));
+        assert!(
+            !enabled.is_raw_argmax(),
+            "an active DRY penalty rewrites logits and must disqualify"
+        );
+
+        // And the no-op claim itself: with a disabled DRY the sampled token
+        // equals the no-DRY token on the same fixture (greedy, so exact).
+        let rng = || Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(0)));
+        let ctx = [5u32, 5, 5, 5];
+        let t_none = none
+            .sample(logits(), &ctx, false, rng(), false, false)
+            .unwrap()
+            .token;
+        let t_disabled = disabled
+            .sample(logits(), &ctx, false, rng(), false, false)
+            .unwrap()
+            .token;
+        assert_eq!(t_disabled, t_none, "disabled DRY must be a behavioural no-op");
+    }
+
+    /// `device_sampling_terminates` must mirror `sample`'s dispatch exactly —
+    /// each disqualifier flips it independently, and the sort/vocab geometry
+    /// matches the fast path's own bounds.
+    #[test]
+    fn device_eligibility_mirrors_the_fast_path_dispatch() {
+        let big_vocab = 129_280; // V4: needs_sort can't fit shared memory
+        let small_vocab = 4_096; // 4096.next_power_of_two() * 4 = 16 KB <= 48 KB
+
+        // Greedy, no penalties: eligible at any vocab, any backend.
+        let greedy = Sampler::new(
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert!(greedy.device_sampling_terminates(big_vocab, false, false));
+        assert!(greedy.device_sampling_terminates(big_vocab, true, false));
+        // return_logprobs needs the CPU pipeline.
+        assert!(!greedy.device_sampling_terminates(big_vocab, true, true));
+
+        // Temperature without a sort (server defaults): eligible.
+        let no_sort = sampler(-1, 1.0, 0.0);
+        assert!(no_sort.device_sampling_terminates(big_vocab, false, false));
+
+        // Temperature with a sort: small vocab fits candle's shared-memory
+        // arg_sort on any backend; big vocab needs the CUDA radix path.
+        let sorted = sampler(32, 1.0, 0.0);
+        assert!(sorted.device_sampling_terminates(small_vocab, false, false));
+        assert_eq!(
+            sorted.device_sampling_terminates(big_vocab, true, false),
+            cfg!(feature = "cuda"),
+            "big-vocab sorted sampling terminates on device iff the CUDA radix \
+             top-k exists in this build"
+        );
+        assert!(!sorted.device_sampling_terminates(big_vocab, false, false));
+
+        // top_k above the radix dispatch cap: the kernel declines statically.
+        let huge_k = sampler(2048, 1.0, 0.0);
+        assert!(!huge_k.device_sampling_terminates(big_vocab, true, false));
+
+        // A penalty disqualifies regardless of geometry.
+        let penalised = Sampler::new(
+            Some(0.7),
+            0,
+            None,
+            Some(0.5),
+            None,
+            None,
+            None,
+            -1,
+            1.0,
+            0.0,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert!(!penalised.device_sampling_terminates(big_vocab, true, false));
+    }
+}
+
+/// $0 host-cost probe at V4's vocabulary.
+///
+/// **This times CPU code on a CPU tensor. It is evidence about HOST cost
+/// only — it validates nothing about GPU behaviour (D14).** It exists to put
+/// a number on what one sequence pays per token when it lands on the CPU
+/// sampling pipeline, under (i) bench params (`top_k = 32`) and (ii) the
+/// server defaults (`top_k = -1`, `top_p = 1.0`, `min_p = 0.0` —
+/// `engine/add_request.rs`), which before the sort-skip fix ran a full
+/// 129,280-element `sort_unstable_by` whose result nothing consumed.
+///
+/// Deliberately `#[ignore]`d: it is a manual instrument, not a gate. Run with
+/// `cargo test -p mistralrs-core --release host_cost_probe -- --ignored --nocapture`.
+///
+/// The parity fixture above stays at `VOCAB = 4096` on purpose: its pure-top-p
+/// cases depend on nucleus containment in the top 1024, which does not hold
+/// for this spread at 129,280.
+#[cfg(test)]
+mod host_cost_probe {
+    use super::Sampler;
+    use candle_core::{Device, Tensor};
+    use rand::SeedableRng;
+    use rand_isaac::Isaac64Rng;
+    use std::sync::{Arc, Mutex};
+
+    /// DeepSeek-V4's vocabulary.
+    const PROBE_VOCAB: usize = 129_280;
+
+    /// Same LCG as `topk_parity_tests::peaked_logits`, at probe size.
+    fn probe_logits(seed: u64) -> Vec<f32> {
+        let mut state: u64 = seed ^ 0xDEAD_BEEF_CAFE_F00D;
+        (0..PROBE_VOCAB)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 32) as u32 as f32 / u32::MAX as f32) * 12.0 - 6.0
+            })
+            .collect()
+    }
+
+    fn probe_sampler(top_k: i64, top_p: f64, min_p: f64) -> Sampler {
+        Sampler::new(
+            Some(0.7),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            top_k,
+            top_p,
+            min_p,
+            None,
+            vec![],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn time_us_per_call(sampler: &Sampler) -> (f64, f64) {
+        const WARMUP: usize = 3;
+        const ITERS: usize = 30;
+        let logits = Tensor::from_vec(probe_logits(7), PROBE_VOCAB, &Device::Cpu).unwrap();
+        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+        let ctx = [1u32, 2, 3];
+        for _ in 0..WARMUP {
+            sampler
+                .sample(logits.clone(), &ctx, false, rng.clone(), false, true)
+                .unwrap();
+        }
+        let mut samples_us = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            sampler
+                .sample(logits.clone(), &ctx, false, rng.clone(), false, true)
+                .unwrap();
+            samples_us.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        let mean = samples_us.iter().sum::<f64>() / ITERS as f64;
+        let min = samples_us.iter().cloned().fold(f64::INFINITY, f64::min);
+        (mean, min)
+    }
+
+    #[test]
+    #[ignore = "manual $0 probe: prints per-call CPU sampling cost at V4 vocab; \
+                run with --ignored --nocapture. Host-cost evidence only, never \
+                GPU validation (D14)."]
+    fn time_cpu_sample_at_v4_vocab() {
+        let (bench_mean, bench_min) = time_us_per_call(&probe_sampler(32, 1.0, 0.0));
+        let (srv_mean, srv_min) = time_us_per_call(&probe_sampler(-1, 1.0, 0.0));
+        println!(
+            "HOST_PROBE vocab={PROBE_VOCAB} bench(top_k=32): mean={bench_mean:.0}us min={bench_min:.0}us"
+        );
+        println!(
+            "HOST_PROBE vocab={PROBE_VOCAB} server(top_k=-1,top_p=1.0): mean={srv_mean:.0}us min={srv_min:.0}us"
+        );
     }
 }
 

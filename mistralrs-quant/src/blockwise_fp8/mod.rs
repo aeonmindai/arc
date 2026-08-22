@@ -95,6 +95,20 @@ impl QuantMethod for BlockwiseFP8Linear {
             // A/B runs from a single binary.
             let m_rows: usize = x.dims().iter().rev().skip(1).product();
             let prefer_cublas = m_rows >= arc_fp8_cublas_min_m();
+            if prefer_cublas
+                && matches!(x.device(), candle_core::Device::Cuda(_))
+                && ffi::HAVE_BLOCKWISE_GEMM_KERNELS
+            {
+                // Engagement line for the threshold sweep: this forward was
+                // DIVERTED from the native FP8 kernels to dequantize+cuBLASLt
+                // by `ARC_FP8_CUBLAS_MIN_M`. `ARC_LOG_FP8_DISPATCH=1` only.
+                ops::log_fp8_dispatch(
+                    ops::Fp8DispatchPath::DequantCublaslt,
+                    m_rows,
+                    self.weight.dims().first().copied().unwrap_or(0),
+                    x.dims().last().copied().unwrap_or(0),
+                );
+            }
             if !prefer_cublas
                 && matches!(x.device(), candle_core::Device::Cuda(_))
                 && ffi::HAVE_BLOCKWISE_GEMM_KERNELS
@@ -143,6 +157,34 @@ impl QuantMethod for BlockwiseFP8Linear {
             weight,
             self.bias.clone(),
         )))?;
+
+        // 🔴 FLATTEN TO 2-D FIRST — the native branch above already does this at
+        // the top of `forward`, and this branch did not.
+        //
+        // V4's activation is rank-3 `[B, T, hidden]`. Passed through untouched,
+        // `UnquantLinear::forward` takes `w.broadcast_left(B)` and, because bias
+        // is `None` on every V4 linear, dispatches `cublaslt.batch_matmul` with
+        // `stride_b = 0`. At decode T=1, so that is a **B-way batched GEMM with
+        // m=1** — a batched GEMV wearing a GEMM's name, which is the one shape
+        // cuBLASLt has no advantage in. The documented 27x was measured at
+        // prefill, where `[1, 512, hidden]` collapses to batch=1 and the call is
+        // a genuine `[512, hidden] x [hidden, N]` GEMM.
+        //
+        // Without this, lowering `ARC_FP8_CUBLAS_MIN_M` measures the batched-GEMV
+        // path and concludes "cuBLASLt loses at decode" — a wrong conclusion
+        // drawn from a shape the threshold change was never meant to select.
+        // Flattening makes the two branches comparable, which is the whole
+        // premise of the A/B.
+        let orig_dims = x.dims().to_vec();
+        if orig_dims.len() > 2 {
+            let features = orig_dims[orig_dims.len() - 1];
+            let rows: usize = orig_dims[..orig_dims.len() - 1].iter().product();
+            let out = unquant.forward(&x.reshape((rows, features))?)?;
+            let out_features = out.dim(out.rank() - 1)?;
+            let mut new_dims = orig_dims[..orig_dims.len() - 1].to_vec();
+            new_dims.push(out_features);
+            return out.reshape(new_dims);
+        }
         unquant.forward(x)
     }
 
@@ -644,10 +686,30 @@ pub fn blockwise_fp8_linear_b(
 /// **The measurement that settles this constant:** re-run the M sweep with the
 /// flatten fix present, three arms, on one binary —
 /// `ARC_FP8_CUBLAS_MIN_M`/`ARC_NO_FP8_WMMA` toggle all three with no rebuild —
-/// and set the default to the first M at which (a) beats `min((b), (c))`. Until
-/// then the default stays where it is, because moving it would be a *second*
-/// constant with no measurement behind it, which is the exact defect this doc
-/// exists to record.
+/// and set the default to the first M at which (a) beats `min((b), (c))`.
+///
+/// # ✅ THAT SWEEP HAS NOW RUN — s10, and 64 is the measured crossover
+///
+/// 2026-08-22, box `arc-s10-ledger` (H200), candidate `4d03b9e25`, V4-Flash,
+/// `arc-tools/fp8_threshold_sweep.sh`, LADDER {8, 64, 256}, three arms, one
+/// binary, flatten fix present, >=1000-token floor per row (M=8 rows VOID on
+/// the floor and make no claim):
+///
+/// ```text
+///     M       arm  tokens   wall_s     tok/s   status
+///    64     tiled    2811     12.6     223.1   CLEAN
+///    64      wmma    2811      8.6     328.2   CLEAN
+///    64  cublaslt    3072      5.6     552.4   CLEAN  <- (a) beats min((b),(c))
+///   256     tiled   12288     43.0     285.8   CLEAN
+///   256      wmma   11244     18.1     620.4   CLEAN
+///   256  cublaslt   12288     17.2     715.9   CLEAN  <- and again
+/// ```
+///
+/// First clean M where (a) beats min((b), (c)): **64**. The default moves to
+/// that measured point. M=8 stays with the native arms (its rows were void, so
+/// no claim is made about 5..63 — the conservative side of a void row is to
+/// leave it with the incumbent). `fp8_gemv_warp` still owns M <= 4; the M=1
+/// floor row from the earlier sweep (cuBLASLt 0.72x at M=1) still stands.
 ///
 /// `fp8_gemv_warp` still owns `M <= 4` and is not affected by this constant.
 ///
@@ -656,11 +718,11 @@ pub fn blockwise_fp8_linear_b(
 #[cfg(feature = "cuda")]
 fn arc_fp8_cublas_min_m() -> usize {
     use std::sync::OnceLock;
-    // Still 512. NOT because 512 is right -- the doc above shows it is a single
-    // prefill point -- but because the only sweep in hand measured the scalar
-    // kernel that #200 displaced, and lowering this to 5 on that evidence would
-    // make the tensor-core GEMM dead code at every M >= 5. Re-sweep three arms.
-    const DEFAULT_MIN_M: usize = 512;
+    // 64 = the first CLEAN M at which dequantize+cuBLASLt beats min(WMMA,
+    // tiled) in the s10 three-arm sweep (arc-s10-ledger, 4d03b9e25; rows in
+    // the doc above). M=8 rows were VOID on the token floor, so 5..63 stays
+    // with the native arms rather than being claimed by interpolation.
+    const DEFAULT_MIN_M: usize = 64;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var("ARC_FP8_CUBLAS_MIN_M")

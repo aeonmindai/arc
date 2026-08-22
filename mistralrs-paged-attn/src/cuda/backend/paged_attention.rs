@@ -712,10 +712,11 @@ pub fn turbo_reshape_and_cache(
 
     let dev = k.device();
     let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
-    if head_size != 128 {
+    if !turbo_supports_head_dim(head_size) {
         candle::bail!(
-            "turbo_reshape_and_cache only supports head_size=128 (got {head_size}); \
-             the TurboQuant kernel would exit without writing anything"
+            "turbo_reshape_and_cache has no kernel instantiation for head_size={head_size} \
+             (have {TURBO_HEAD_DIMS:?}); the launch would fall through the dispatch switch \
+             and write nothing"
         );
     }
 
@@ -768,6 +769,21 @@ pub fn turbo_reshape_and_cache(
         )
     }
     Ok(())
+}
+
+/// Head dimensions `turbo_paged_attention.cu` instantiates its kernels for.
+///
+/// Must stay equal to `TURBOQUANT_CUDA_HEAD_DIMS` in
+/// `mistralrs-quant::turboquant::cuda_tables`, which is where the test lives
+/// that parses this declaration and the kernel's dispatch switch and fails if
+/// the three disagree. A width missing here is merely refused; a width present
+/// here but missing from the switch would launch nothing and leave the caller
+/// reading uninitialized memory.
+pub const TURBO_HEAD_DIMS: [usize; 4] = [64, 128, 256, 512];
+
+/// Whether the TurboQuant kernels have an instantiation for `head_dim`.
+pub fn turbo_supports_head_dim(head_dim: usize) -> bool {
+    TURBO_HEAD_DIMS.contains(&head_dim)
 }
 
 /// TurboQuant: paged attention over compressed U8 KV cache.
@@ -827,10 +843,11 @@ pub fn turbo_paged_attention(
 
     let dev = q_s.device();
     let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
-    if head_size != 128 {
+    if !turbo_supports_head_dim(head_size) {
         candle::bail!(
-            "turbo_paged_attention only supports head_size=128 (got {head_size}); \
-             the kernel would exit early and return an uninitialized output buffer"
+            "turbo_paged_attention has no kernel instantiation for head_size={head_size} \
+             (have {TURBO_HEAD_DIMS:?}); the launch would fall through the dispatch switch \
+             and return an uninitialized output buffer"
         );
     }
     let max_num_blocks_per_seq = bt_l.shape().dims2()?.1;

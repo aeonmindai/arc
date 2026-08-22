@@ -119,6 +119,39 @@ static REGISTRY: &[Capability] = &[
         },
         status: Status::Live,
     },
+    // ── SHIPPED OFF, WITH A NAMED EXPERIMENT ────────────────────────────────
+    //
+    // The entry below is `Live` because the GATE is reached on every step —
+    // that is what this file checks, and it must not go dark. What is switched
+    // off is the gate's DEFAULT ANSWER, which no reachability check can see.
+    //
+    // Recording it here anyway, because "built, correct, tested, and switched
+    // off" is this repo's most expensive failure mode and this file is where
+    // someone goes looking for it. 26 pieces of finished work are parked that
+    // way right now, including a complete GPU sampler with zero callers; we
+    // shipped 34 tok/s of landed work while master served 17, for exactly this
+    // reason. A flag that ships off with no named experiment behind it is how
+    // that happens, so the experiment is named:
+    //
+    //   flag  ARC_V4_XS_PIN_WINDOW=1
+    //   gate  kv_cache/xs_rolling.rs :: xs_pin_window_enabled_from
+    //   test  arc-tools/arcspec_perseq_ladder.sh — ON vs ON_PINNED, uniform
+    //         B=32, one binary, same prompt and seed
+    //   pass  ON_PINNED faster on aggregate tok/s, generated tokens identical
+    //   was   +23.2% at uniform B=32 on #121's own pre-rebase branch — NOT a
+    //         current fact, do not quote it as one
+    //   then  the default flips to ON in the same change that records the
+    //         number. Leaving it off after a passing measurement is a failure
+    //         state, not the finish line.
+    Capability {
+        name: "xs window pin: built and tested, default OFF pending one measurement",
+        parent: "ArcInfer / ArcKV",
+        check: Check::Symbol {
+            symbol: "xs_pin_window_enabled",
+            defined_in: "mistralrs-core/src/kv_cache/xs_rolling.rs",
+        },
+        status: Status::Live,
+    },
     Capability {
         name: "ragged decode: per-row lengths on the xs cache",
         parent: "ArcInfer / ArcKV",
@@ -137,6 +170,116 @@ static REGISTRY: &[Capability] = &[
         },
         status: Status::Live,
     },
+    // ── SHIPPED OFF, WITH A NAMED EXPERIMENT ────────────────────────────────
+    //
+    // This entry is `Live` because the GATE is reached on every layer of every
+    // step — that is what this file checks, and it must not go dark. What is
+    // switched off is the gate's DEFAULT ANSWER at `batch > 1`, which no
+    // reachability check can see.
+    //
+    // Recorded here anyway, because "built, correct, tested, and switched off"
+    // is this repo's most expensive failure mode and this file is where someone
+    // goes looking for it. 26 pieces of finished work are parked that way right
+    // now, including a complete GPU sampler with zero callers; we shipped
+    // 34 tok/s of landed work while master served 17, for exactly this reason.
+    //
+    // The kernel is batch-correct by construction and the dispatch bug that
+    // kept it dead above batch 1 (`seqlen_offsets.len() != 1` — the LENGTH of
+    // the vector where the property needed is the DISTINCTNESS of its values)
+    // is fixed. It is off only because fixing that gate makes a CUDA kernel
+    // live on a path it has never run on, and this repo has paid for that twice
+    // in one week: TCFRAG (default-ON, "UNVERIFIED ON HARDWARE — NEVER RUN" in
+    // its own header, 63 GB held, a layer permanently broken, retired by #209)
+    // and the fused-512 attention path (four days silently dropping the
+    // attention mask at 12% agreement).
+    //
+    //   flag  ARC_QK_FUSED_COHORT (default ON since s10; "0" is the kill switch)
+    //   gate  cuda/qk_norm_rope.rs :: fused_cohort_enabled_from
+    //   MEASURED s10 leg 4 (box arc-s10-ledger H200, candidate 4d03b9e25):
+    //         ENGAGED at B=256, seeded canaries byte-identical to the eager
+    //         arm, 599.35 vs 575.12 tok/s aggregate (the +4.2% sits inside the
+    //         ~±5% inter-leg variance measured the same session — the default
+    //         stands on engaged + bit-identical + not-slower).
+    //   then  DONE: the default flipped to ON in the same session, as this
+    //         entry always demanded. Leaving it off after a passing
+    //         measurement is a failure state, not the finish line.
+    Capability {
+        name: "fused qk_norm_rope at B>1: default ON, measured s10",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "fused_cohort_enabled",
+            defined_in: "mistralrs-core/src/cuda/qk_norm_rope.rs",
+        },
+        status: Status::Live,
+    },
+    // Same shape as the entry above, same doctrine, one rung lower in the
+    // stack: the V4 rotary's RAGGED arm. Uniform cohorts already take one
+    // batched `rope_i` unconditionally (that dispatch is exact and shipped
+    // ON); this flag governs rows at genuinely different positions, which the
+    // per-sequence loop served at ~9 ops × 43 layers × B per step. The
+    // gathered rank-3 path is bit-identical to the loop
+    // (`deepseek_ragged_cohort_tests`) and default OFF until measured.
+    //
+    //   flag  ARC_ROPE_COHORT=1 (read by value via env_flag_is_set)
+    //   gate  layers.rs :: rope_cohort_enabled
+    //   test  one binary, ragged B>1 decode (ARC_MTP_PER_SEQ_KV on, or any
+    //         producer of unequal offsets), flag set vs unset
+    //   pass  outputs bit-identical AND the gathered arm faster;
+    //         rope_cohort_stats::counts() shows cohort > 0 on the flagged arm
+    //   then  the default flips in the same change that records the number
+    Capability {
+        name: "ragged-cohort RoPE: one gathered rope_i for unequal offsets, default OFF",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "rope_cohort_enabled",
+            defined_in: "mistralrs-core/src/layers.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
+        // The mask the entry above forces into existence, built on the DEVICE:
+        // the host triple-loop build (kept as
+        // `make_left_padded_causal_mask_host`, the test oracle) was 4.2 MB of
+        // host work + H2D per token at B=256 ctx-4096, i.e. the thing that
+        // would make ragged decode read as a regression. If production stops
+        // reaching this builder, ragged batches are serving unmasked dead
+        // prefixes — silently wrong, not slow.
+        name: "ragged decode: the left-padded mask is built device-side",
+        parent: "ArcInfer / ArcAttention",
+        check: Check::Symbol {
+            symbol: "make_left_padded_causal_mask",
+            defined_in: "mistralrs-core/src/layers_masker.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
+        // The channel the SCHEDULER reads to stop exact-length bucketing.
+        // `batch_can_be_ragged` (above) is the producer; this is the consumer
+        // side, and either going dark re-imposes the one-bucket-per-step
+        // ceiling with no error anywhere.
+        name: "ragged decode: the scheduler reads the published capability",
+        parent: "ArcInfer / ArcSched",
+        check: Check::Symbol {
+            symbol: "ragged_decode_supported",
+            defined_in: "mistralrs-core/src/kv_cache/mod.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
+        // The supported ON-switch for the V4 ragged pair
+        // (`--v4-ragged-decode` / `v4_ragged_decode` config key, with
+        // `ARC_V4_XS_PER_SEQ` as the env fallback). A capability reachable
+        // only through an undocumented env var is indistinguishable from one
+        // that does not exist — which is how the ragged-batching result stayed
+        // off the shipped configuration once already.
+        name: "ragged decode: the CLI/config surface latches the V4 xs flag",
+        parent: "ArcInfer / ArcKV",
+        check: Check::Symbol {
+            symbol: "request_xs_per_sequence",
+            defined_in: "mistralrs-core/src/kv_cache/xs_rolling.rs",
+        },
+        status: Status::Live,
+    },
     Capability {
         name: "prefill admission cap (--prefill-max-seqs)",
         parent: "ArcInfer / ArcSched",
@@ -147,7 +290,11 @@ static REGISTRY: &[Capability] = &[
         status: Status::Live,
     },
     Capability {
-        name: "prompt-starvation floor (--prefill-floor-steps)",
+        // Default ON since arcsched/ragged-and-floor: unset resolves to a
+        // floor of 4 (`DEFAULT_PREFILL_FLOOR_STEPS`);
+        // `ARC_PREFILL_FLOOR_STEPS=0` is the kill-switch that restores the
+        // pre-floor selection key for key.
+        name: "prompt-starvation floor (ARC_PREFILL_FLOOR_STEPS, default 4)",
         parent: "ArcInfer / ArcSched",
         check: Check::Symbol {
             symbol: "prefill_starvation_floor",
@@ -161,6 +308,50 @@ static REGISTRY: &[Capability] = &[
         check: Check::Symbol {
             symbol: "mark_unreachable",
             defined_in: "arc-profiler/src/lib.rs",
+        },
+        status: Status::Live,
+    },
+    Capability {
+        name: "sampling: ARC_SAMPLE_ON_DEVICE keeps batched logits on the device",
+        parent: "ArcInfer / ArcSample",
+        check: Check::Symbol {
+            symbol: "sample_on_device_enabled",
+            defined_in: "mistralrs-core/src/pipeline/mod.rs",
+        },
+        // Default OFF (env_flag_is_set, value-parsed), consulted by the
+        // DefaultInstructions step arm before the batched logits host copy.
+        // If this goes dark, every batch B > 1 is back to a 66 MB/step serial
+        // D2H that also disqualifies all rows from the GPU sampler fast path.
+        status: Status::Live,
+    },
+    Capability {
+        name: "FP8 dispatch engagement log (ARC_LOG_FP8_DISPATCH)",
+        parent: "ArcLab",
+        check: Check::Symbol {
+            symbol: "log_fp8_dispatch",
+            defined_in: "mistralrs-quant/src/blockwise_fp8/ops.rs",
+        },
+        // The engagement line the FP8 threshold sweep
+        // (`arc-tools/fp8_threshold_sweep.sh`) greps per leg to prove WHICH
+        // kernel actually served it. Value-read (`env_flag_is_set`), latched
+        // once per process, one line per path per process. Referenced from
+        // both native dispatch arms in `ops.rs` and from the
+        // dequantize+cuBLASLt divert in `blockwise_fp8/mod.rs`.
+        status: Status::Live,
+    },
+    // Flipped default-ON in session 10 after its hardware A/B (box
+    // `arc-s10-ledger`, candidate `4d03b9e25`, leg 3): b=1 decode 43.80 vs
+    // 40.76 tok/s (+7.5%, 3x512 produced tokens, seeded), engagement proven by
+    // `[arc-fp8-dispatch] path=gemv_wide`, coherence canary correct. The
+    // ledger's ~1.6x prediction did NOT materialise end-to-end; +7.5% is the
+    // measured number and the one this default stands on. `ARC_FP8_GEMV_WIDE=0`
+    // (exact string) is the kill switch; value-read (#212 doctrine).
+    Capability {
+        name: "FP8 wide b=1 GEMV (ARC_FP8_GEMV_WIDE): default ON, measured s10",
+        parent: "ArcKernels",
+        check: Check::Symbol {
+            symbol: "wide_enabled",
+            defined_in: "mistralrs-quant/src/blockwise_fp8/gemv_wide.rs",
         },
         status: Status::Live,
     },
@@ -196,17 +387,20 @@ static REGISTRY: &[Capability] = &[
             accepted_in: &["mistralrs-core/src/sampler.rs"],
             honoured_in: &["arc-cuda-graph/src/autonomous.rs"],
         },
-        // `AutonomousDecodeConfig` (autonomous.rs:70-82) carries temperature,
-        // top_p, both penalties and `greedy` — and neither top_k nor min_p. A
-        // request setting them would have them silently dropped the moment this
-        // path is reached. It is not reached today (`mark_unreachable(
-        // "cuda_graph.autonomous_decode", ...)`), which is the only reason this
-        // is not already a user-visible defect.
-        status: Status::Tracked {
-            reason: "AutonomousDecodeConfig has no top_k field at all; the path is itself \
-                     unreachable today, so this is latent rather than live. Fix before \
-                     GPU-autonomous decode is switched on.",
-        },
+        // Was Tracked with the reason "AutonomousDecodeConfig has no top_k
+        // field at all". #130 gave it one: `AutonomousDecodeConfig::top_k`
+        // (autonomous.rs:82), plumbed into `sampling_cpu::SamplingConfig` at
+        // autonomous.rs:643 and consumed by `self.sampler.sample(..)`. So the
+        // promise is now honoured where it is made, and the status follows the
+        // code.
+        //
+        // The gate flagged this itself, on the rebase, with "PROMOTE ME" —
+        // the same way the greedy/logit-bias entry above was promoted. That is
+        // the mechanism working, not a test to be silenced.
+        //
+        // `min_p` is a separate entry below and stays Tracked: it still has no
+        // field on `AutonomousDecodeConfig`.
+        status: Status::Live,
     },
     Capability {
         name: "sampling: min_p survives onto the GPU-autonomous decode path",
@@ -220,6 +414,20 @@ static REGISTRY: &[Capability] = &[
             reason: "AutonomousDecodeConfig has no min_p field at all; same shape and same \
                      blocking condition as the top_k entry above.",
         },
+    },
+    Capability {
+        name: "ArcGraph device decode loop opt-in gate (ARC_GRAPH_DEVICE_LOOP)",
+        parent: "ArcInfer / ArcGraph",
+        check: Check::Symbol {
+            symbol: "device_loop_enabled",
+            defined_in: "arc-cuda-graph/src/device_loop.rs",
+        },
+        // The gate is opt-in default-off, but the CALL PATH must be live:
+        // `normal.rs::forward_inputs` consults `device_loop_enabled()` before
+        // `device_decode_burst`. If this reference disappears, the env var
+        // parses forever and engages nothing — the switched-off class this
+        // file exists to catch.
+        status: Status::Live,
     },
 ];
 

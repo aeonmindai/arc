@@ -96,6 +96,13 @@ pub struct NormalPipeline {
     /// load time; graph capture is deferred until first decode call.
     #[cfg(feature = "cuda")]
     autonomous_runner: Option<arc_cuda_graph::AutonomousDecodeRunner>,
+    /// ArcInfer/ArcGraph device decode loop — replays the captured graph,
+    /// samples and scatters the token on device, and never synchronizes. Built
+    /// lazily on the first admitted decode step and then kept, because every
+    /// buffer it points at must stay at the address the graph baked.
+    /// Opt-in via `ARC_GRAPH_DEVICE_LOOP`; `None` until then.
+    #[cfg(feature = "cuda")]
+    device_decode_loop: Option<arc_cuda_graph::DeviceDecodeLoop>,
 }
 
 /// What a forward pass should do with candle's caching allocator before it
@@ -160,11 +167,7 @@ pub(crate) enum AllocCacheAction {
 /// Pure, so the policy is testable without a GPU — which matters, because the
 /// allocator itself has no tests at all in either repo.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn alloc_cache_action(
-    seq_len: usize,
-    enabled: bool,
-    killed: bool,
-) -> AllocCacheAction {
+pub(crate) fn alloc_cache_action(seq_len: usize, enabled: bool, killed: bool) -> AllocCacheAction {
     let want = !killed && seq_len == 1;
     match (want, enabled) {
         (true, false) => AllocCacheAction::Enable,
@@ -1986,6 +1989,10 @@ impl Loader for NormalLoader {
             // lazy init (and graph capture) once a real decode batch arrives.
             #[cfg(feature = "cuda")]
             autonomous_runner: None,
+            // Needs the captured graph's exec handle and output tensor, so it
+            // cannot exist before capture. Built on the first admitted step.
+            #[cfg(feature = "cuda")]
+            device_decode_loop: None,
         })))
     }
 
@@ -2108,6 +2115,205 @@ impl MetadataMixin for NormalPipeline {
     }
 }
 
+#[cfg(feature = "cuda")]
+/// Drive one burst of the ArcInfer/ArcGraph device decode loop.
+///
+/// Returns `Some(logits)` when the step is covered — either because a burst
+/// just ran or because a previous burst already produced this step's token
+/// — and `None` to fall back.
+///
+/// The tokens go to `arc_cuda_graph`'s pending queue and are drained one at
+/// a time by `pipeline/sampling.rs`, so the engine's per-token `Sequence`
+/// bookkeeping (stop strings, streaming, EOS) is unchanged.
+///
+/// ⚠️ On the `pending > 0` path this returns the captured graph's output
+/// tensor **without launching anything**, so those logits are the last
+/// burst's, not this step's. That is sound only because the sampling hook
+/// short-circuits before reading them and, at batch 1,
+/// `pipeline/mod.rs:538` does no host copy. It is not a general-purpose
+/// return value, which is why this whole path refuses anything that would
+/// actually read the logits (`return_logprobs`, logits processors,
+/// penalties, grammars).
+fn device_decode_burst(
+    device: &Device,
+    runner: &mut arc_cuda_graph::CudaGraphRunner,
+    loop_slot: &mut Option<arc_cuda_graph::DeviceDecodeLoop>,
+    bs: usize,
+    seq_len: usize,
+    current_position: u32,
+    input_ids_pinned: &Tensor,
+) -> Option<Tensor> {
+    use arc_cuda_graph as acg;
+
+    // Stand aside for the replay-verification lane (PR #205). This branch sits
+    // EARLIER in the chain than the `runner.replay(bs)` arm, so without this it
+    // would take every step and `ARC_GRAPH_VERIFY_ALWAYS=1` would silently
+    // verify nothing — the operator would get a clean diagnostic that never
+    // ran. A verification switch that is quietly bypassed is worse than one
+    // that is off.
+    if std::env::var("ARC_GRAPH_VERIFY_ALWAYS").as_deref() == Ok("1") {
+        return None;
+    }
+
+    let (_exec, out) = runner.replay_handles(bs)?;
+
+    // A burst already produced this step's token: no launch, no sync, no
+    // GPU work at all. This is where the amortisation actually shows up —
+    // `burst - 1` of every `burst` engine iterations do nothing but host
+    // bookkeeping.
+    //
+    // Guarded twice, because returning `out` here hands back an ALIASING
+    // tensor from an earlier launch and skips this step's forward entirely —
+    // sound only when the very next sample takes a parked token:
+    // * `seq_len == 1` — parked tokens present at a PREFILL step belong to a
+    //   sequence that left the running set without a state change (the
+    //   bucketing waitlist); serving the new request's prefill from them
+    //   would skip the prefill and leak the old sequence's tokens.
+    // * `pending_owned_by_current()` — the queue must belong to the sequence
+    //   whose sample published eligibility last, i.e. the one this decode
+    //   step is for at batch 1.
+    // Either violation drops the parked tokens (loudly) and falls through to
+    // the real forward.
+    if acg::pending_token_count() > 0 {
+        if seq_len == 1 && acg::pending_owned_by_current() {
+            acg::note_aliased_logits_served();
+            return Some(out);
+        }
+        tracing::warn!(
+            "ArcGraph: dropped {} foreign parked tokens — parked queue found at a step it does \
+             not belong to (seq_len={}, owned_by_current={}); running the real forward instead",
+            acg::pending_token_count(),
+            seq_len,
+            acg::pending_owned_by_current(),
+        );
+        acg::stand_down();
+    }
+
+    // The fixed-capacity KV window width. Read from the graph-mode mask's
+    // last dimension rather than guessed: `models/deepseek4.rs` builds that
+    // mask as `[B, 1, 1, cfg_full.sliding_window]`, and `cfg_full` is a
+    // model fact the pipeline cannot otherwise reach.
+    let capacity = match crate::layers::graph_mode_mask() {
+        Some(m) => *m.dims().last().unwrap_or(&0),
+        None => {
+            // The mask is what keeps the decode arm from reading unwritten
+            // KV slots; without it we cannot bound the burst.
+            acg::stand_down();
+            return None;
+        }
+    };
+    let vocab = *out.dims().last().unwrap_or(&0);
+    if capacity == 0 || vocab == 0 {
+        acg::stand_down();
+        return None;
+    }
+
+    let cfg = acg::DeviceLoopConfig {
+        position_limit: capacity as u32,
+        ..acg::DeviceLoopConfig::new(vocab, -1, capacity as u32)
+    };
+
+    let facts = acg::AdmissionFacts {
+        batch_size: bs,
+        seq_len,
+        graph_ready: runner.replay_output_trusted(),
+        // Established by `sampling.rs` from the Sequence on the previous
+        // step; false until one has confirmed it.
+        greedy: acg::device_loop_eligible(),
+        return_logprobs: false,
+        host_side_logits_work: false,
+        current_position,
+    };
+    let steps = match acg::admit(&facts, &cfg, acg::device_loop_enabled()) {
+        Ok(s) => s,
+        Err(reason) => {
+            tracing::debug!("ArcGraph device loop declined this step: {reason}");
+            acg::stand_down();
+            return None;
+        }
+    };
+
+    if loop_slot.is_none() {
+        let positions = crate::layers::graph_mode_positions();
+        match acg::DeviceDecodeLoop::new(
+            device,
+            _exec,
+            runner.stream(),
+            &out,
+            input_ids_pinned,
+            positions.as_ref(),
+            cfg,
+        ) {
+            Ok(l) => {
+                tracing::info!(
+                    "ArcGraph device decode loop ENGAGED: burst={} vocab={vocab} \
+                     kv_window={capacity}. {}",
+                    cfg.burst,
+                    l.status_line()
+                );
+                *loop_slot = Some(l);
+            }
+            Err(e) => {
+                acg::kill_device_loop(&format!("could not build the device loop: {e}"));
+                return None;
+            }
+        }
+    }
+    let dl = loop_slot.as_mut()?;
+
+    match dl.run(steps) {
+        Ok(outcome) => {
+            // `first()` rather than `[0]`: a burst that returned no rows would
+            // be a bug, but it must not panic the engine thread mid-request.
+            let row = match outcome.tokens.first() {
+                Some(r) => r,
+                None => {
+                    acg::kill_device_loop("burst returned no token rows");
+                    *loop_slot = None;
+                    return None;
+                }
+            };
+            acg::push_pending_tokens(row);
+            // ── ALIASING CONTRACT, ENFORCED ─────────────────────────────
+            // The tensor we are about to return aliases the graph-owned
+            // storage that the NEXT `cuGraphLaunch` overwrites. It is only
+            // safe to hand back because the sampling hook short-circuits
+            // before anything reads it — and that hook fires if and only if a
+            // token is pending. So the invariant is not "we reasoned it
+            // through", it is checked here: no pending token, no aliasing
+            // tensor. `push_pending_tokens` drops negative ids, so a row that
+            // was entirely garbage lands here rather than silently arriving at
+            // a `sample_sequence` that would then read clobbered logits and
+            // return a plausible wrong token.
+            if acg::pending_token_count() == 0 {
+                acg::kill_device_loop(
+                    "burst produced no usable token, so the aliasing logits tensor must not be \
+                     returned",
+                );
+                *loop_slot = None;
+                return None;
+            }
+            runner.record_device_loop_steps(outcome.steps_launched as u64);
+            if outcome.hit_eos {
+                tracing::debug!(
+                    "ArcGraph device loop: EOS at token {} of a {}-step burst; the remaining \
+                     steps were already enqueued and are discarded",
+                    row.len(),
+                    outcome.steps_launched
+                );
+            }
+            Some(out)
+        }
+        Err(e) => {
+            // A burst failure means the graph input buffer may hold an
+            // uncommitted or stale id, so this cannot be retried.
+            acg::kill_device_loop(&format!("burst failed: {e}"));
+            *loop_slot = None;
+            None
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Pipeline for NormalPipeline {
     fn forward_inputs(
@@ -2202,9 +2408,7 @@ impl Pipeline for NormalPipeline {
                                 cd.set_alloc_cache_enabled(true);
                                 arm_alloc_cache_capacity(cd, &alloc_cache_device);
                             }
-                            AllocCacheAction::DrainAndDisable => {
-                                cd.set_alloc_cache_enabled(false)
-                            }
+                            AllocCacheAction::DrainAndDisable => cd.set_alloc_cache_enabled(false),
                             // Steady-state decode. The cap has to be re-armed
                             // here and not only on the Enable edge: free VRAM
                             // shrinks token by token as the KV cache grows, so
@@ -2256,6 +2460,11 @@ impl Pipeline for NormalPipeline {
                             }
                         }
                     }
+                    // Bound before the chain: `self.device()` returns by value,
+                    // and taking a reference to it inside an expression that
+                    // also takes `&mut self.device_decode_loop` would borrow
+                    // `self` both ways at once.
+                    let dev_for_loop = self.device();
                     let captured: Option<Tensor> = if probe
                         && seq_len == 1
                         && self.cuda_graph_runner.is_some()
@@ -2275,6 +2484,12 @@ impl Pipeline for NormalPipeline {
                             // per-forward alloc count (eager warmups only
                             // reach peak-live; capture needs every alloc
                             // distinct). Output is this step's logits (eager).
+                            // Snapshot the allocator's size profile so we can see
+                            // whether this pass teaches it anything new.
+                            let demand_before = match self.device() {
+                                candle_core::Device::Cuda(cd) => cd.capture_alloc_demand(),
+                                _ => Vec::new(),
+                            };
                             if let candle_core::Device::Cuda(cd) = self.device() {
                                 cd.set_capture_mode(true);
                             }
@@ -2311,6 +2526,40 @@ impl Pipeline for NormalPipeline {
                             );
                             if let candle_core::Device::Cuda(cd) = self.device() {
                                 cd.set_capture_mode(false);
+                            }
+                            // Keep warming while the profile is still growing.
+                            // One pass is only enough if every decode step
+                            // allocates the same sizes; V4's compressor tail
+                            // cycles through `ratio` widths, so pass k presents a
+                            // size pass k-1 never did and the profile keeps
+                            // growing until the whole cycle has been walked. A
+                            // pass that adds nothing is the signal to stop — and
+                            // it costs one eager decode step to learn that.
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                let demand_after = cd.capture_alloc_demand();
+                                if demand_after != demand_before {
+                                    let granted = runner.grant_extra_deferred_pass();
+                                    tracing::info!(
+                                        "ARC prewarm: warm pass grew the alloc profile to {} \
+                                         distinct sizes — {} (extra budget {}, {} pass(es) owed)",
+                                        demand_after.len(),
+                                        if granted {
+                                            "granting another pass"
+                                        } else {
+                                            "extra budget exhausted; the capture-miss assert \
+                                             decides from here"
+                                        },
+                                        runner.deferred_extra_budget(),
+                                        runner.deferred_passes_remaining(),
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "ARC prewarm: alloc profile CONVERGED at {} distinct \
+                                         sizes ({} pass(es) still owed)",
+                                        demand_after.len(),
+                                        runner.deferred_passes_remaining(),
+                                    );
+                                }
                             }
                             match out {
                                 Ok(o) => {
@@ -2377,6 +2626,55 @@ impl Pipeline for NormalPipeline {
                                          (PROBE — not a fix; the buffer still allocates per step)"
                                 );
                             }
+                            // ── EXACT PRE-WARM ────────────────────────────
+                            // The warm passes leave the free pool holding
+                            // exactly what the steps they ran on asked for. The
+                            // step about to be CAPTURED is a different step: any
+                            // size whose demand is higher here, or that only
+                            // appears here, is served by `cuMemAllocAsync` from
+                            // the graph's private pool and becomes an unstable
+                            // graph memory node — CUDA_ERROR_ILLEGAL_ADDRESS on
+                            // the first cuGraphLaunch, and a poisoned context
+                            // (reported as glibc heap corruption) after it.
+                            //
+                            // So top every observed size up to its observed
+                            // demand plus slack. Slack is what covers a captured
+                            // step that allocates a little more of some size
+                            // than any warm step did; it is buffers, not bytes,
+                            // and the pool is ~315 MiB, so it is cheap.
+                            //
+                            // Must run with capture mode OFF: a buffer released
+                            // while capturing parks in `deferred` and cannot be
+                            // served, so seeding inside the window warms nothing.
+                            if let candle_core::Device::Cuda(cd) = self.device() {
+                                let slack = std::env::var("ARC_GRAPH_PREWARM_SLACK")
+                                    .ok()
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                    .unwrap_or(4);
+                                let demand = cd.capture_alloc_demand();
+                                let want: usize = demand.iter().map(|(_, n)| n).sum();
+                                match cd.prewarm_alloc_cache(slack) {
+                                    Ok((sizes, buffers)) => tracing::info!(
+                                        "ARC prewarm: profile = {} distinct sizes / {want} \
+                                         allocations per captured forward; topped up {sizes} \
+                                         size(s) with {buffers} buffer(s) at slack={slack}",
+                                        demand.len(),
+                                    ),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "ARC prewarm: could not top up the alloc cache: {e}. \
+                                             Capturing now would record unstable memory nodes, so \
+                                             capture is disabled for this run."
+                                        );
+                                        runner.disable();
+                                    }
+                                }
+                                // Scope the miss ledger to THIS capture. Without
+                                // the reset it would still carry the misses the
+                                // warm passes made on purpose, and those are
+                                // harmless — no graph is being recorded then.
+                                cd.reset_capture_misses();
+                            }
                             // CAPTURE: frees are deferred so every allocation
                             // is a stable cache hit (no within-capture
                             // aliasing, no unstable graph memory nodes).
@@ -2403,127 +2701,179 @@ impl Pipeline for NormalPipeline {
                                         &flash_meta,
                                     ) {
                                         Ok(output) => {
-                                            tracing::info!(
-                                                    "ARC capture: V4 forward RECORDED (bs={bs}); instantiating + launching"
+                                            // ── THE GATE ──────────────────
+                                            // Every allocation that missed the
+                                            // warm pool during this capture was
+                                            // served from the graph's private
+                                            // pool and recorded as a memory node
+                                            // whose address the first launch has
+                                            // to back. One is enough to fault.
+                                            // Refusing here is strictly better
+                                            // than instantiating: the fault is
+                                            // asynchronous and poisons the CUDA
+                                            // context, taking the process with
+                                            // it some allocations later.
+                                            let misses = match self.device() {
+                                                candle_core::Device::Cuda(cd) => {
+                                                    cd.capture_misses()
+                                                }
+                                                _ => Vec::new(),
+                                            };
+                                            if !misses.is_empty() {
+                                                let total: usize =
+                                                    misses.iter().map(|(_, n)| n).sum();
+                                                tracing::error!(
+                                                    "ARC capture: REFUSING to instantiate — \
+                                                     {total} allocation(s) missed the warm pool \
+                                                     during capture, at (bytes, count) {misses:?}. \
+                                                     Each is an unstable graph memory node. The \
+                                                     pre-warm profile did not cover this step, so \
+                                                     these sizes are step-dependent beyond the \
+                                                     warm cycle: the fix is a shape-constant \
+                                                     buffer at those sizes (or allocator \
+                                                     size-class bucketing), not more warmup. \
+                                                     Falling back to eager."
                                                 );
-                                            match runner.end_capture_and_cache(bs, output, gp, op) {
-                                                Ok(out) => {
-                                                    tracing::info!(
+                                                // Drop the captured output BEFORE
+                                                // cancelling: its storage may live
+                                                // in the private pool, and
+                                                // cancel_capture drains the alloc
+                                                // cache before destroying that
+                                                // pool. Dropping after the drain
+                                                // would file a dangling pointer
+                                                // into the free list — the exact
+                                                // use-after-free the drain exists
+                                                // to prevent.
+                                                drop(output);
+                                                runner.cancel_capture(gp, op);
+                                                runner.disable();
+                                                None
+                                            } else {
+                                                tracing::info!(
+                                                    "ARC capture: V4 forward RECORDED (bs={bs}), zero capture-time allocator misses; instantiating + launching"
+                                                );
+                                                match runner
+                                                    .end_capture_and_cache(bs, output, gp, op)
+                                                {
+                                                    Ok(out) => {
+                                                        tracing::info!(
                                                         "ARC capture: graph CAPTURED + launched OK"
                                                     );
-                                                    if arc_layer_bisect() {
-                                                        let bufs =
-                                                            crate::layers::arc_layer_trace_take();
-                                                        tracing::error!(
-                                                            "ARC BISECT: holding {} captured layer buffers",
-                                                            bufs.as_ref()
-                                                                .map(|b| b.len())
-                                                                .unwrap_or(0)
-                                                        );
-                                                        ARC_GRAPH_LAYER_BUFS
-                                                            .with(|c| *c.borrow_mut() = bufs);
-                                                    }
-                                                    // ── SAME-STEP PROBE ─────────────
-                                                    // Separates the two ways a graph can
-                                                    // be wrong, which the replay-step
-                                                    // comparison cannot tell apart.
-                                                    //
-                                                    // Here the position buffer, the token
-                                                    // ids and the KV ring are EXACTLY what
-                                                    // capture recorded against — nothing
-                                                    // has advanced. So:
-                                                    //   Δ ≈ 0  ⇒ the graph is wired right
-                                                    //            and the replay-step Δ is
-                                                    //            stale per-step state.
-                                                    //   Δ large ⇒ a plain wiring fault
-                                                    //            (wrong buffer / wrong
-                                                    //            node); position state is
-                                                    //            innocent.
-                                                    // `error!` on purpose: this is the
-                                                    // measurement the run exists for and
-                                                    // must never be filtered out.
-                                                    if std::env::var("ARC_GRAPH_SAMESTEP")
-                                                        .as_deref()
-                                                        == Ok("1")
-                                                    {
-                                                        if let candle_core::Device::Cuda(cd) =
-                                                            self.device()
-                                                        {
-                                                            cd.set_capture_mode(false);
-                                                        }
-                                                        match self.model.forward(
-                                                            &input_ids,
-                                                            &seqlen_offsets,
-                                                            context_lens.clone(),
-                                                            position_ids.clone(),
-                                                            paged_attn_meta
-                                                                .as_ref()
-                                                                .map(|(a, b)| (a.clone(), b)),
-                                                            &flash_meta,
-                                                        ) {
-                                                            Ok(eager_same) => {
-                                                                match max_abs_diff(
-                                                                    &out,
-                                                                    &eager_same,
-                                                                ) {
-                                                                    Ok(d) => tracing::error!(
-                                                                        "ARC SAMESTEP: first-launch vs eager, SAME step: max|Δ|={d:.3e}"
-                                                                    ),
-                                                                    Err(e) => tracing::error!(
-                                                                        "ARC SAMESTEP: first-launch compare failed: {e}"
-                                                                    ),
-                                                                }
-                                                                // Keep this step's eager
-                                                                // logits: every later replay
-                                                                // is measured against them
-                                                                // too, which is what tells
-                                                                // "frozen" from "partially
-                                                                // advancing".
-                                                                ARC_CAPTURE_STEP_EAGER.with(
-                                                                    |c| {
-                                                                        *c.borrow_mut() =
-                                                                            Some(
-                                                                                eager_same
-                                                                                    .clone(),
-                                                                            );
-                                                                    },
+                                                        if arc_layer_bisect() {
+                                                            let bufs =
+                                                                crate::layers::arc_layer_trace_take(
                                                                 );
-                                                                // Second launch of the same
-                                                                // graph, still same step.
-                                                                // Distinguishes "the graph
-                                                                // is wrong" from "re-launch
-                                                                // specifically is wrong".
-                                                                match runner.replay(bs) {
-                                                                    Ok(again) => {
-                                                                        match max_abs_diff(
-                                                                            &again,
-                                                                            &eager_same,
-                                                                        ) {
-                                                                            Ok(d) => tracing::error!(
-                                                                                "ARC SAMESTEP: re-launch vs eager, SAME step: max|Δ|={d:.3e}"
-                                                                            ),
-                                                                            Err(e) => tracing::error!(
-                                                                                "ARC SAMESTEP: re-launch compare failed: {e}"
-                                                                            ),
-                                                                        }
-                                                                    }
-                                                                    Err(e) => tracing::error!(
-                                                                        "ARC SAMESTEP: second launch failed: {e}"
-                                                                    ),
-                                                                }
-                                                            }
-                                                            Err(e) => tracing::error!(
-                                                                "ARC SAMESTEP: eager forward failed: {e}"
-                                                            ),
+                                                            tracing::error!(
+                                                                "ARC BISECT: holding {} captured layer buffers",
+                                                                bufs.as_ref()
+                                                                    .map(|b| b.len())
+                                                                    .unwrap_or(0)
+                                                            );
+                                                            ARC_GRAPH_LAYER_BUFS
+                                                                .with(|c| *c.borrow_mut() = bufs);
                                                         }
+                                                        // ── SAME-STEP PROBE ─────────────
+                                                        // Separates the two ways a graph can
+                                                        // be wrong, which the replay-step
+                                                        // comparison cannot tell apart.
+                                                        //
+                                                        // Here the position buffer, the token
+                                                        // ids and the KV ring are EXACTLY what
+                                                        // capture recorded against — nothing
+                                                        // has advanced. So:
+                                                        //   Δ ≈ 0  ⇒ the graph is wired right
+                                                        //            and the replay-step Δ is
+                                                        //            stale per-step state.
+                                                        //   Δ large ⇒ a plain wiring fault
+                                                        //            (wrong buffer / wrong
+                                                        //            node); position state is
+                                                        //            innocent.
+                                                        // `error!` on purpose: this is the
+                                                        // measurement the run exists for and
+                                                        // must never be filtered out.
+                                                        if std::env::var("ARC_GRAPH_SAMESTEP")
+                                                            .as_deref()
+                                                            == Ok("1")
+                                                        {
+                                                            if let candle_core::Device::Cuda(cd) =
+                                                                self.device()
+                                                            {
+                                                                cd.set_capture_mode(false);
+                                                            }
+                                                            match self.model.forward(
+                                                                &input_ids,
+                                                                &seqlen_offsets,
+                                                                context_lens.clone(),
+                                                                position_ids.clone(),
+                                                                paged_attn_meta
+                                                                    .as_ref()
+                                                                    .map(|(a, b)| (a.clone(), b)),
+                                                                &flash_meta,
+                                                            ) {
+                                                                Ok(eager_same) => {
+                                                                    match max_abs_diff(
+                                                                        &out,
+                                                                        &eager_same,
+                                                                    ) {
+                                                                        Ok(d) => tracing::error!(
+                                                                            "ARC SAMESTEP: first-launch vs eager, SAME step: max|Δ|={d:.3e}"
+                                                                        ),
+                                                                        Err(e) => tracing::error!(
+                                                                            "ARC SAMESTEP: first-launch compare failed: {e}"
+                                                                        ),
+                                                                    }
+                                                                    // Keep this step's eager
+                                                                    // logits: every later replay
+                                                                    // is measured against them
+                                                                    // too, which is what tells
+                                                                    // "frozen" from "partially
+                                                                    // advancing".
+                                                                    ARC_CAPTURE_STEP_EAGER.with(
+                                                                        |c| {
+                                                                            *c.borrow_mut() =
+                                                                                Some(
+                                                                                    eager_same
+                                                                                        .clone(),
+                                                                                );
+                                                                        },
+                                                                    );
+                                                                    // Second launch of the same
+                                                                    // graph, still same step.
+                                                                    // Distinguishes "the graph
+                                                                    // is wrong" from "re-launch
+                                                                    // specifically is wrong".
+                                                                    match runner.replay(bs) {
+                                                                        Ok(again) => {
+                                                                            match max_abs_diff(
+                                                                                &again,
+                                                                                &eager_same,
+                                                                            ) {
+                                                                                Ok(d) => tracing::error!(
+                                                                                    "ARC SAMESTEP: re-launch vs eager, SAME step: max|Δ|={d:.3e}"
+                                                                                ),
+                                                                                Err(e) => tracing::error!(
+                                                                                    "ARC SAMESTEP: re-launch compare failed: {e}"
+                                                                                ),
+                                                                            }
+                                                                        }
+                                                                        Err(e) => tracing::error!(
+                                                                            "ARC SAMESTEP: second launch failed: {e}"
+                                                                        ),
+                                                                    }
+                                                                }
+                                                                Err(e) => tracing::error!(
+                                                                    "ARC SAMESTEP: eager forward failed: {e}"
+                                                                ),
+                                                            }
+                                                        }
+                                                        Some(out)
                                                     }
-                                                    Some(out)
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
+                                                    Err(e) => {
+                                                        tracing::warn!(
                                                             "ARC capture: instantiate/launch failed: {e}; eager"
                                                         );
-                                                    None
+                                                        None
+                                                    }
                                                 }
                                             }
                                         }
@@ -2555,6 +2905,32 @@ impl Pipeline for NormalPipeline {
                                 cd.set_capture_mode(false);
                             }
                             cap_result
+                        } else if runner.has_graph(bs)
+                            && arc_cuda_graph::device_loop_enabled()
+                            && !arc_cuda_graph::device_loop_killed()
+                            && device_decode_burst(
+                                &dev_for_loop,
+                                &mut runner,
+                                &mut self.device_decode_loop,
+                                bs,
+                                seq_len,
+                                seqlen_offsets.first().copied().unwrap_or(0) as u32,
+                                &input_ids,
+                            )
+                            .is_some()
+                        {
+                            // ArcInfer/ArcGraph device decode loop: the burst
+                            // already ran (or a previous one covered this step),
+                            // the token was sampled and scattered on device, and
+                            // `pipeline/sampling.rs` will take it from the ring.
+                            // No sync, no host sample, no D2H.
+                            //
+                            // The logits handed back are the captured graph's
+                            // output tensor. They are NOT read: the sampling
+                            // hook short-circuits first, and at batch 1
+                            // `pipeline/mod.rs:538` does no host copy. Admission
+                            // refuses everything that would read them.
+                            runner.replay_handles(bs).map(|(_, out)| out)
                         } else if runner.has_graph(bs) {
                             let t = std::time::Instant::now();
                             let replayed = runner.replay(bs);
@@ -3021,6 +3397,16 @@ impl Pipeline for NormalPipeline {
                 top_p,
                 frequency_penalty,
                 presence_penalty,
+                // mistral.rs uses <=0 to mean "disabled"; the fused sampler
+                // spells that -1 (`sampling_cpu.rs:16`).
+                top_k: {
+                    let tk = first_sampler.top_k();
+                    if tk <= 0 {
+                        -1
+                    } else {
+                        tk as i32
+                    }
+                },
                 greedy,
             };
 
@@ -3412,10 +3798,7 @@ mod alloc_cache_policy_tests {
     /// enabling the cache.
     #[test]
     fn degenerate_zero_length_forward_does_not_enable() {
-        assert_eq!(
-            alloc_cache_action(0, false, false),
-            AllocCacheAction::Leave
-        );
+        assert_eq!(alloc_cache_action(0, false, false), AllocCacheAction::Leave);
         assert_eq!(
             alloc_cache_action(0, true, false),
             AllocCacheAction::DrainAndDisable

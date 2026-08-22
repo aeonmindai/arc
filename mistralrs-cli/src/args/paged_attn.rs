@@ -59,15 +59,18 @@ pub struct PagedAttentionOptions {
     /// this flag off gives you TurboQuant KV and, with it, no prefix caching.
     /// Pass `auto` to opt out. Every other geometry — MLA layouts and every
     /// other head_dim — auto-falls back to `auto` with a warning, so those
-    /// models are unaffected. Setting the flag explicitly turns that fallback
-    /// into a hard error instead.
+    /// models are unaffected. Setting the flag explicitly widens the accepted
+    /// set to every instantiated head_dim (64/128/256/512) and turns that
+    /// fallback into a hard error instead.
     /// Provenance: TurboQuant K4/V3 has one end-to-end serving run behind it —
     /// Qwen3-32B on a B200, 55 tok/s with correct output (2026-04-06). That run
     /// was b=1, head_dim 128, on Blackwell, and it did not isolate TurboQuant
     /// from the rest of the decode path. There is no A/B against an
     /// unquantized cache and no quality evaluation at any preset, so treat
-    /// quality as unestablished; `turboquant-3` and `turboquant-aggressive`
-    /// have never run at all.
+    /// quality as unestablished; 64/256/512 are compiled but have never
+    /// executed on hardware, which is why the default will not choose them for
+    /// you, and `turboquant-3` and `turboquant-aggressive` have never run at
+    /// all.
     // Hidden: overriding Arc's resolved KV cache type is the clearest way to
     // silently make a deployment worse — every TurboQuant variant currently
     // disables prefix caching, and an explicit choice converts the safe

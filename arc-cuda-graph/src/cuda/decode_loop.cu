@@ -152,3 +152,115 @@ extern "C" void launch_check_all_done_conditional(
 extern "C" int arc_has_graph_conditional() {
     return ARC_HAS_GRAPH_CONDITIONAL;
 }
+
+// ============================================================================
+// ArcInfer/ArcGraph — device decode loop step commit
+//
+// The narrow sibling of `decode_step_update` above, for the CUDA-graph replay
+// path (`arc-cuda-graph/src/device_loop.rs`). That kernel is written for the
+// paged-attention autonomous runner and unconditionally dereferences
+// `finished`, `n_generated`, `slot_mappings` and `block_tables`; the replay
+// path has none of those (V4 runs with `cache_config == None`), so passing
+// nulls would fault. This kernel touches only what that path actually owns.
+//
+// It closes the decode loop on-device:
+//   sampled token  ->  the PINNED U32 buffer the captured graph reads
+//                  ->  device position += 1
+//                  ->  pinned+mapped host ring, for the host to drain later
+//
+// Ordering is load-bearing. Every range check runs BEFORE any write, and the
+// ring write head is published LAST, after `__threadfence_system()`. So a token
+// the host can see in the ring is guaranteed to have been committed to the
+// graph input buffer, and a refused commit publishes nothing at all rather than
+// letting the next launch consume a garbage id.
+// ============================================================================
+
+#define ARC_COMMIT_FAULT_NONE           0
+#define ARC_COMMIT_FAULT_TOKEN_RANGE    1
+#define ARC_COMMIT_FAULT_POSITION_LIMIT 2
+
+__global__ void arc_graph_step_commit(
+    const int32_t* __restrict__ sampled,   // [batch] i32, written by CudaSampler
+    uint32_t* __restrict__ input_ids,      // [batch] U32, PINNED graph input
+    uint32_t* __restrict__ positions,      // [batch] U32, PINNED graph input; nullable
+    int32_t*  __restrict__ ring,           // [batch, ring_size] pinned + mapped
+    int32_t*  __restrict__ ring_head,      // [batch] pinned + mapped
+    int32_t*  __restrict__ fault,          // [1] pinned + mapped, sticky
+    int32_t ring_size,
+    int32_t vocab,
+    int32_t position_limit,                // exclusive; <= 0 disables the check
+    int32_t batch_size
+) {
+    int bid = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    if (bid >= batch_size) return;
+
+    // A fault latched by an earlier step means the graph input buffer already
+    // holds a stale id. Committing on top of that would paper over it.
+    if (fault != nullptr && ((volatile int32_t*)fault)[0] != ARC_COMMIT_FAULT_NONE) return;
+
+    int token = sampled[bid];
+
+    // ---- checks first, writes after -------------------------------------
+    if (token < 0 || token >= vocab) {
+        if (fault != nullptr) {
+            ((volatile int32_t*)fault)[0] = ARC_COMMIT_FAULT_TOKEN_RANGE;
+            __threadfence_system();
+        }
+        return;
+    }
+    if (positions != nullptr && position_limit > 0) {
+        // `positions[bid]` is the slot this step just wrote KV to. The next
+        // step writes at +1, and the fixed-capacity window is `position_limit`
+        // wide, so +1 must stay strictly inside it.
+        if ((int64_t)positions[bid] + 1 >= (int64_t)position_limit) {
+            if (fault != nullptr) {
+                ((volatile int32_t*)fault)[0] = ARC_COMMIT_FAULT_POSITION_LIMIT;
+                __threadfence_system();
+            }
+            return;
+        }
+    }
+
+    // ---- commit ---------------------------------------------------------
+    // This single store is what removes the host from the loop: the captured
+    // graph baked THIS address at capture time, so the next `cuGraphLaunch`
+    // reads the token without any host round trip.
+    input_ids[bid] = (uint32_t)token;
+    if (positions != nullptr) {
+        positions[bid] += 1u;
+    }
+
+    // ---- publish last ----------------------------------------------------
+    if (ring != nullptr && ring_head != nullptr && ring_size > 0) {
+        int wp = ring_head[bid];
+        int slot = wp % ring_size;
+        if (slot < 0) slot += ring_size;
+        ((volatile int32_t*)ring)[(int64_t)bid * ring_size + slot] = token;
+        // Order the token store ahead of the head store as seen by the HOST.
+        // Without this the host can observe an advanced head and read the
+        // previous occupant of the slot.
+        __threadfence_system();
+        ((volatile int32_t*)ring_head)[bid] = wp + 1;
+    }
+}
+
+extern "C" void arc_launch_graph_step_commit(
+    const int32_t* sampled,
+    uint32_t* input_ids,
+    uint32_t* positions,
+    int32_t* ring,
+    int32_t* ring_head,
+    int32_t* fault,
+    int32_t ring_size,
+    int32_t vocab,
+    int32_t position_limit,
+    int32_t batch_size,
+    cudaStream_t stream
+) {
+    arc_graph_step_commit<<<batch_size, 1, 0, stream>>>(
+        sampled, input_ids, positions,
+        ring, ring_head, fault,
+        ring_size, vocab, position_limit, batch_size
+    );
+}
