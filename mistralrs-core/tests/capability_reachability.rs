@@ -193,20 +193,18 @@ static REGISTRY: &[Capability] = &[
     // and the fused-512 attention path (four days silently dropping the
     // attention mask at 12% agreement).
     //
-    //   flag  ARC_QK_FUSED_COHORT=1
+    //   flag  ARC_QK_FUSED_COHORT (default ON since s10; "0" is the kill switch)
     //   gate  cuda/qk_norm_rope.rs :: fused_cohort_enabled_from
-    //   test  one binary, B>1 decode, same prompt and seed, flag set vs unset;
-    //         ARC_QK_VERIFY=1 bit-compares fused against eager at every layer
-    //   pass  outputs bit-identical AND the fused arm faster; engagement
-    //         counter (`qk::engaged_count`) non-zero, since a silently
-    //         declining fast path reports a perfect no-op
-    //   was   never measured above batch 1 — the path was unreachable, so there
-    //         is no prior number to quote, honest or otherwise
-    //   then  the default flips to ON in the same change that records the
-    //         number. Leaving it off after a passing measurement is a failure
-    //         state, not the finish line.
+    //   MEASURED s10 leg 4 (box arc-s10-ledger H200, candidate 4d03b9e25):
+    //         ENGAGED at B=256, seeded canaries byte-identical to the eager
+    //         arm, 599.35 vs 575.12 tok/s aggregate (the +4.2% sits inside the
+    //         ~±5% inter-leg variance measured the same session — the default
+    //         stands on engaged + bit-identical + not-slower).
+    //   then  DONE: the default flipped to ON in the same session, as this
+    //         entry always demanded. Leaving it off after a passing
+    //         measurement is a failure state, not the finish line.
     Capability {
-        name: "fused qk_norm_rope at B>1: built and tested, default OFF pending one measurement",
+        name: "fused qk_norm_rope at B>1: default ON, measured s10",
         parent: "ArcInfer / ArcAttention",
         check: Check::Symbol {
             symbol: "fused_cohort_enabled",

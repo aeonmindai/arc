@@ -1338,7 +1338,7 @@ impl Attention {
         // `qk::fused_cohort_enabled` for the doctrine and for how to turn the
         // cohort path on once it has been measured on hardware.
         if qb > 1 && !qk::fused_cohort_enabled() {
-            decline!("batched cohort is opt-in (set ARC_QK_FUSED_COHORT=1)");
+            decline!("batched cohort disabled by ARC_QK_FUSED_COHORT=0 (default is ON since s10)");
         }
         match kv_normed.dims3() {
             Ok((kb, kt, kh)) if kb == qb && kt == qt && kh == head_dim => {}
