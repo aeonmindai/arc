@@ -29,14 +29,17 @@
 //! contraction — contraction is identical in both kernels and so cancels out
 //! of the comparison.
 //!
-//! # Why the gate is opt-in
+//! # Why the gate is default-ON
 //!
-//! 🔴 The kernel is UNVERIFIED ON HARDWARE. [`wide_enabled`] reads
-//! `ARC_FP8_GEMV_WIDE` and is true **only** for the exact value `"1"`.
-//! `ARC_FP8_GEMV_WIDE=0`, `=off`, `=true` and unset all leave it OFF. That
-//! strictness is deliberate: this crate already ships `ARC_NO_FP8_GEMV`, read
-//! with `std::env::var(..).is_ok()` (`blockwise_fp8/ops.rs`), where `=0`
-//! *enables* the disable — the polarity bug this form cannot have.
+//! ✅ MEASURED ON HARDWARE 2026-08-22, box `arc-s10-ledger` (H200), candidate
+//! `4d03b9e25`, session-10 leg 3: b=1 decode 43.80 tok/s vs 40.76 baseline
+//! (+7.5%, 3×512 produced tokens, seeded t=0.7 p=0.95), engagement proven by
+//! `[arc-fp8-dispatch] path=gemv_wide`, coherence canary correct (numerics
+//! shift the sampled continuation within the stated f32 bound; canary1 was
+//! byte-identical, canary2 coherent and arithmetically right). Per the flip
+//! doctrine the default turned ON in the same session as the measurement.
+//! `ARC_FP8_GEMV_WIDE=0` — and only the exact string `"0"` — restores the
+//! warp GEMV from the same binary. Value-read, never presence-read (#212).
 
 // This module is exactly two things: a gate that only a CUDA build calls, and
 // a CPU model of the kernel that only `mod tests` calls. On a non-CUDA build
@@ -56,16 +59,19 @@ pub(crate) const WARP_K_PER_ITER: usize = 128;
 /// K-elements one lane of `fp8_gemv_wide` owns per iteration.
 pub(crate) const WIDE_K_PER_LANE: usize = 16;
 
-/// `ARC_FP8_GEMV_WIDE` — opt-in switch for the wide b=1 GEMV.
+/// `ARC_FP8_GEMV_WIDE` — kill switch for the wide b=1 GEMV (default ON).
 ///
 /// Split from the env read so the polarity is unit-testable. Only the exact
-/// string `"1"` enables.
+/// string `"0"` disables; everything else (unset included) leaves the
+/// measured-faster wide kernel on. Measured: s10 leg 3, `arc-s10-ledger`,
+/// `4d03b9e25`, 43.80 vs 40.76 tok/s b=1.
 pub(crate) fn wide_enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
+    value != Some("0")
 }
 
-/// `ARC_FP8_GEMV_WIDE=1` enables `fp8_gemv_wide` for eligible b=1 shapes.
-/// Default OFF. Read once; the decode hot loop never touches the env.
+/// `ARC_FP8_GEMV_WIDE=0` disables `fp8_gemv_wide` for eligible b=1 shapes.
+/// Default ON (measured +7.5% b=1). Read once; the decode hot loop never
+/// touches the env.
 #[cfg(feature = "cuda")]
 pub(crate) fn wide_enabled() -> bool {
     use std::sync::OnceLock;
@@ -636,21 +642,20 @@ mod tests {
         );
     }
 
-    /// Env polarity: only the exact string "1" turns the kernel on. Guards
+    /// Env polarity after the s10 default flip: only the exact string "0"
+    /// turns the kernel OFF. Still value-read, never presence-read — guards
     /// against the `ARC_NO_DEDICATED_DECODE` failure, where `var_os(..)
     /// .is_some()` makes `=0` *enable* the flag.
     #[test]
-    fn only_literal_one_enables() {
-        assert!(wide_enabled_from(Some("1")));
-        for v in [
-            "0", "", "on", "off", "true", "false", "yes", "no", "2", " 1", "1 ",
-        ] {
+    fn only_literal_zero_disables() {
+        assert!(!wide_enabled_from(Some("0")), "`ARC_FP8_GEMV_WIDE=0` must disable");
+        for v in ["1", "", "on", "off", "true", "false", "yes", "no", "2", " 0", "0 "] {
             assert!(
-                !wide_enabled_from(Some(v)),
-                "`ARC_FP8_GEMV_WIDE={v}` must not enable"
+                wide_enabled_from(Some(v)),
+                "`ARC_FP8_GEMV_WIDE={v}` must leave the measured default ON"
             );
         }
-        assert!(!wide_enabled_from(None), "unset must not enable");
+        assert!(wide_enabled_from(None), "unset must stay ON (the measured default)");
     }
 
     /// The gate must reject every shape whose preconditions the kernel relies

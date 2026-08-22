@@ -341,6 +341,22 @@ static REGISTRY: &[Capability] = &[
         // dequantize+cuBLASLt divert in `blockwise_fp8/mod.rs`.
         status: Status::Live,
     },
+    // Flipped default-ON in session 10 after its hardware A/B (box
+    // `arc-s10-ledger`, candidate `4d03b9e25`, leg 3): b=1 decode 43.80 vs
+    // 40.76 tok/s (+7.5%, 3x512 produced tokens, seeded), engagement proven by
+    // `[arc-fp8-dispatch] path=gemv_wide`, coherence canary correct. The
+    // ledger's ~1.6x prediction did NOT materialise end-to-end; +7.5% is the
+    // measured number and the one this default stands on. `ARC_FP8_GEMV_WIDE=0`
+    // (exact string) is the kill switch; value-read (#212 doctrine).
+    Capability {
+        name: "FP8 wide b=1 GEMV (ARC_FP8_GEMV_WIDE): default ON, measured s10",
+        parent: "ArcKernels",
+        check: Check::Symbol {
+            symbol: "wide_enabled",
+            defined_in: "mistralrs-quant/src/blockwise_fp8/gemv_wide.rs",
+        },
+        status: Status::Live,
+    },
     // -- the ApiPromise class ------------------------------------------------
     Capability {
         name: "sampling: logit_bias reaches the sampler",
