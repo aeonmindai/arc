@@ -193,20 +193,18 @@ static REGISTRY: &[Capability] = &[
     // and the fused-512 attention path (four days silently dropping the
     // attention mask at 12% agreement).
     //
-    //   flag  ARC_QK_FUSED_COHORT=1
+    //   flag  ARC_QK_FUSED_COHORT (default ON since s10; "0" is the kill switch)
     //   gate  cuda/qk_norm_rope.rs :: fused_cohort_enabled_from
-    //   test  one binary, B>1 decode, same prompt and seed, flag set vs unset;
-    //         ARC_QK_VERIFY=1 bit-compares fused against eager at every layer
-    //   pass  outputs bit-identical AND the fused arm faster; engagement
-    //         counter (`qk::engaged_count`) non-zero, since a silently
-    //         declining fast path reports a perfect no-op
-    //   was   never measured above batch 1 — the path was unreachable, so there
-    //         is no prior number to quote, honest or otherwise
-    //   then  the default flips to ON in the same change that records the
-    //         number. Leaving it off after a passing measurement is a failure
-    //         state, not the finish line.
+    //   MEASURED s10 leg 4 (box arc-s10-ledger H200, candidate 4d03b9e25):
+    //         ENGAGED at B=256, seeded canaries byte-identical to the eager
+    //         arm, 599.35 vs 575.12 tok/s aggregate (the +4.2% sits inside the
+    //         ~±5% inter-leg variance measured the same session — the default
+    //         stands on engaged + bit-identical + not-slower).
+    //   then  DONE: the default flipped to ON in the same session, as this
+    //         entry always demanded. Leaving it off after a passing
+    //         measurement is a failure state, not the finish line.
     Capability {
-        name: "fused qk_norm_rope at B>1: built and tested, default OFF pending one measurement",
+        name: "fused qk_norm_rope at B>1: default ON, measured s10",
         parent: "ArcInfer / ArcAttention",
         check: Check::Symbol {
             symbol: "fused_cohort_enabled",
@@ -339,6 +337,22 @@ static REGISTRY: &[Capability] = &[
         // once per process, one line per path per process. Referenced from
         // both native dispatch arms in `ops.rs` and from the
         // dequantize+cuBLASLt divert in `blockwise_fp8/mod.rs`.
+        status: Status::Live,
+    },
+    // Flipped default-ON in session 10 after its hardware A/B (box
+    // `arc-s10-ledger`, candidate `4d03b9e25`, leg 3): b=1 decode 43.80 vs
+    // 40.76 tok/s (+7.5%, 3x512 produced tokens, seeded), engagement proven by
+    // `[arc-fp8-dispatch] path=gemv_wide`, coherence canary correct. The
+    // ledger's ~1.6x prediction did NOT materialise end-to-end; +7.5% is the
+    // measured number and the one this default stands on. `ARC_FP8_GEMV_WIDE=0`
+    // (exact string) is the kill switch; value-read (#212 doctrine).
+    Capability {
+        name: "FP8 wide b=1 GEMV (ARC_FP8_GEMV_WIDE): default ON, measured s10",
+        parent: "ArcKernels",
+        check: Check::Symbol {
+            symbol: "wide_enabled",
+            defined_in: "mistralrs-quant/src/blockwise_fp8/gemv_wide.rs",
+        },
         status: Status::Live,
     },
     // -- the ApiPromise class ------------------------------------------------

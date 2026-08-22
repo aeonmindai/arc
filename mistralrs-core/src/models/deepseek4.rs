@@ -1338,7 +1338,7 @@ impl Attention {
         // `qk::fused_cohort_enabled` for the doctrine and for how to turn the
         // cohort path on once it has been measured on hardware.
         if qb > 1 && !qk::fused_cohort_enabled() {
-            decline!("batched cohort is opt-in (set ARC_QK_FUSED_COHORT=1)");
+            decline!("batched cohort disabled by ARC_QK_FUSED_COHORT=0 (default is ON since s10)");
         }
         match kv_normed.dims3() {
             Ok((kb, kt, kh)) if kb == qb && kt == qt && kh == head_dim => {}
@@ -1991,8 +1991,8 @@ impl Attention {
                 graph_attn
             }
             None => {
-                // FP8 code storage is opt-in (`ARC_V4_FP8_KV=1`); unset stores
-                // the dense BF16 K the model has always stored.
+                // FP8 code storage is default-ON since s10 (`ARC_V4_FP8_KV=0`
+                // restores the dense BF16 K layout).
                 let cached = {
                     let _s = arc_profiler::device_span("kv_cache_append");
                     append_kv_mqa(
@@ -3159,16 +3159,21 @@ fn append_graph_kv_mqa(
     Ok(k_full)
 }
 
-/// FP8 storage for the cached K. **Opt-in: off unless `ARC_V4_FP8_KV=1`.**
+/// FP8 storage for the cached K. **Default ON since the s10 GPU A/B;
+/// `ARC_V4_FP8_KV=0` restores the BF16 layout.**
 ///
 /// wave43-BU shipped this defaulted ON without ever running it on a GPU — its
 /// own notes said *"needs a GPU: first CUDA exercise of a U8 `SingleCache`"* —
 /// and the first V4 forward on a commit that contained it died, every request,
 /// with `dtype mismatch in slice-set, lhs: BF16, rhs: U8` (wave48-BY). The
 /// layout is sound and bit-exact (see [`super::dsv4_kv_fp8`]); what was never
-/// exercised is the CUDA leg of it. Until a GPU A/B has shown
-/// `ARC_V4_FP8_KV=1` and unset producing token-identical greedy output, the
-/// default is the layout that has actually served (wave49-BZ).
+/// exercised was the CUDA leg. That A/B has now run: s10 leg 10 (box
+/// `arc-s10-ledger`, H200, candidate `4d03b9e25`) — seeded canaries
+/// byte-identical to the BF16 arm, b=1 41.49 vs 40.76 tok/s (not slower), and
+/// engagement PROVEN by nsys kernel capture (`arc_kv_fp8_quantize_kernel`
+/// 16,297 launches, `arc_kv_fp8_dequantize_kernel` 32,594 in one b=1 run —
+/// the U8 CUDA leg genuinely executed). This is the difference from wave43:
+/// the same default, now standing on a measurement instead of a hope.
 ///
 /// Also forced off under `ARC_V4_CAPTURE_PROBE`: the CUDA-graph decode arm
 /// writes through `mistralrs_quant::kvwrite::write_kv_inplace`, which is
@@ -3228,7 +3233,10 @@ fn v4_fp8_kv_enabled() -> bool {
 /// about the default, which is exactly the kind of test DOCTRINE D12 counts as
 /// worse than none.
 fn fp8_kv_enabled_from(var: Option<&str>, capture_probe: bool) -> bool {
-    var == Some("1") && !capture_probe
+    // Default ON since s10 (measured; see the doc above). The capture-probe
+    // veto is unconditional: write_kv_inplace has no U8 arm, so the graph
+    // decode path and the U8 cache remain mutually exclusive.
+    var != Some("0") && !capture_probe
 }
 
 /// RUN-161 decode profiler. Enabled by `ARC_TIME_DECODE=1`. Accumulates
@@ -5924,17 +5932,27 @@ mod kv_footprint_tests {
     /// purpose: the latter is a `OnceLock`, so a test that set the variable
     /// would resolve it once and prove nothing about the default.
     #[test]
-    fn v4_fp8_kv_is_opt_in() {
-        assert!(!fp8_kv_enabled_from(None, false), "unset must be OFF");
-        assert!(!fp8_kv_enabled_from(Some("0"), false));
-        assert!(!fp8_kv_enabled_from(Some(""), false));
-        assert!(!fp8_kv_enabled_from(Some("true"), false));
-        assert!(!fp8_kv_enabled_from(Some("on"), false));
-        assert!(!fp8_kv_enabled_from(Some("2"), false));
+    fn v4_fp8_kv_is_default_on_with_a_literal_zero_kill_switch() {
+        assert!(
+            fp8_kv_enabled_from(None, false),
+            "unset must be ON — measured s10 leg 10 (arc-s10-ledger, 4d03b9e25): \
+             canaries byte-identical, engagement proven by nsys kernel capture"
+        );
+        assert!(!fp8_kv_enabled_from(Some("0"), false), "\"0\" is the kill switch");
+        assert!(fp8_kv_enabled_from(Some(""), false));
+        assert!(fp8_kv_enabled_from(Some("true"), false));
+        assert!(fp8_kv_enabled_from(Some("on"), false));
+        assert!(fp8_kv_enabled_from(Some("2"), false));
         assert!(fp8_kv_enabled_from(Some("1"), false), "=1 must be ON");
         assert!(
             !fp8_kv_enabled_from(Some("1"), true),
             "ARC_V4_CAPTURE_PROBE must veto it: write_kv_inplace has no U8 arm"
+        );
+        assert!(
+            !fp8_kv_enabled_from(None, true),
+            "the veto must hold for the DEFAULT too, not just for explicit =1 — \
+             the capture probe cannot write a U8 cache regardless of how FP8 KV \
+             was selected"
         );
     }
 

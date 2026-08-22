@@ -686,10 +686,30 @@ pub fn blockwise_fp8_linear_b(
 /// **The measurement that settles this constant:** re-run the M sweep with the
 /// flatten fix present, three arms, on one binary —
 /// `ARC_FP8_CUBLAS_MIN_M`/`ARC_NO_FP8_WMMA` toggle all three with no rebuild —
-/// and set the default to the first M at which (a) beats `min((b), (c))`. Until
-/// then the default stays where it is, because moving it would be a *second*
-/// constant with no measurement behind it, which is the exact defect this doc
-/// exists to record.
+/// and set the default to the first M at which (a) beats `min((b), (c))`.
+///
+/// # ✅ THAT SWEEP HAS NOW RUN — s10, and 64 is the measured crossover
+///
+/// 2026-08-22, box `arc-s10-ledger` (H200), candidate `4d03b9e25`, V4-Flash,
+/// `arc-tools/fp8_threshold_sweep.sh`, LADDER {8, 64, 256}, three arms, one
+/// binary, flatten fix present, >=1000-token floor per row (M=8 rows VOID on
+/// the floor and make no claim):
+///
+/// ```text
+///     M       arm  tokens   wall_s     tok/s   status
+///    64     tiled    2811     12.6     223.1   CLEAN
+///    64      wmma    2811      8.6     328.2   CLEAN
+///    64  cublaslt    3072      5.6     552.4   CLEAN  <- (a) beats min((b),(c))
+///   256     tiled   12288     43.0     285.8   CLEAN
+///   256      wmma   11244     18.1     620.4   CLEAN
+///   256  cublaslt   12288     17.2     715.9   CLEAN  <- and again
+/// ```
+///
+/// First clean M where (a) beats min((b), (c)): **64**. The default moves to
+/// that measured point. M=8 stays with the native arms (its rows were void, so
+/// no claim is made about 5..63 — the conservative side of a void row is to
+/// leave it with the incumbent). `fp8_gemv_warp` still owns M <= 4; the M=1
+/// floor row from the earlier sweep (cuBLASLt 0.72x at M=1) still stands.
 ///
 /// `fp8_gemv_warp` still owns `M <= 4` and is not affected by this constant.
 ///
@@ -698,11 +718,11 @@ pub fn blockwise_fp8_linear_b(
 #[cfg(feature = "cuda")]
 fn arc_fp8_cublas_min_m() -> usize {
     use std::sync::OnceLock;
-    // Still 512. NOT because 512 is right -- the doc above shows it is a single
-    // prefill point -- but because the only sweep in hand measured the scalar
-    // kernel that #200 displaced, and lowering this to 5 on that evidence would
-    // make the tensor-core GEMM dead code at every M >= 5. Re-sweep three arms.
-    const DEFAULT_MIN_M: usize = 512;
+    // 64 = the first CLEAN M at which dequantize+cuBLASLt beats min(WMMA,
+    // tiled) in the s10 three-arm sweep (arc-s10-ledger, 4d03b9e25; rows in
+    // the doc above). M=8 rows were VOID on the token floor, so 5..63 stays
+    // with the native arms rather than being claimed by interpolation.
+    const DEFAULT_MIN_M: usize = 64;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var("ARC_FP8_CUBLAS_MIN_M")

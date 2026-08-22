@@ -49,11 +49,16 @@ pub fn fused_enabled() -> bool {
     *ENABLED.get_or_init(|| !matches!(std::env::var("ARC_QK_FUSED").as_deref(), Ok("0")))
 }
 
-/// `ARC_QK_FUSED_COHORT=1` lets the fused kernel serve a **batched** cohort
-/// (`batch > 1`). **Default OFF**, so `batch > 1` declines and takes the eager
-/// chain exactly as it does today.
+/// `ARC_QK_FUSED_COHORT=0` stops the fused kernel from serving a **batched**
+/// cohort (`batch > 1`). **Default ON since the s10 measurement** (box
+/// `arc-s10-ledger`, H200, candidate `4d03b9e25`, leg 4): B=256 decode
+/// aggregate 599.35 vs 575.12 tok/s baseline, seeded canaries byte-identical,
+/// ENGAGED line present at B=256, 0/512 request errors. The +4.2% sits within
+/// the observed inter-leg variance band (~±5%, leg 4b's no-op delta), so the
+/// default stands on "engaged + bit-identical + not slower", not on a claimed
+/// speedup.
 ///
-/// # Why this is opt-in and [`fused_enabled`] is not
+/// # Why this was opt-in until measured, and [`fused_enabled`] never was
 ///
 /// The kernel is batch-correct by construction — `qk_norm_rope.cu` flattens
 /// `(b, t)` into `blockIdx.y`, recovers `b = bt / seq_len`, and reads the table
@@ -72,14 +77,13 @@ pub fn fused_enabled() -> bool {
 ///   attention mask, at 12% agreement with the reference, because nobody ran
 ///   the path it had quietly become live on.
 ///
-/// So the doctrine is: **unverified means default-off, and "unverified" means
-/// unmeasured, not new.** `batch == 1` is unaffected — that path is already
-/// live and already exercised. When the cohort path has been measured correct
-/// and faster on hardware (`ARC_QK_VERIFY=1` bit-compares it against the eager
-/// chain at every layer), this default flips and this doc comment goes with it.
+/// The doctrine was: **unverified means default-off, and "unverified" means
+/// unmeasured, not new.** That measurement has now happened (s10 leg 4, above)
+/// and the default flipped in the same session, exactly as the old comment
+/// promised. `batch == 1` was always unaffected.
 ///
-/// Read by VALUE, `== Some("1")`, not by presence: 23 `ARC_*` flags were
-/// converted this week (#212) precisely because `var_os(..).is_some()` made
+/// Read by VALUE, `!= Some("0")`, not by presence: 23 `ARC_*` flags were
+/// converted (#212) precisely because `var_os(..).is_some()` made
 /// `ARC_FOO=0` mean ON.
 pub fn fused_cohort_enabled() -> bool {
     use std::sync::OnceLock;
@@ -100,7 +104,7 @@ pub fn fused_cohort_enabled() -> bool {
 /// pure function against every input is the only form of this test that means
 /// anything.
 pub fn fused_cohort_enabled_from(value: Option<&str>) -> bool {
-    value == Some("1")
+    value != Some("0")
 }
 
 /// `ARC_QK_VERIFY=1` runs the eager chain alongside the fused kernel at every
@@ -514,23 +518,29 @@ mod cohort_gate_tests {
     /// These run with no features and no GPU, on three operating systems, on
     /// every PR, because the polarity is a pure function.
     #[test]
-    fn the_batched_cohort_is_off_unless_explicitly_enabled() {
+    fn the_batched_cohort_is_on_by_default_since_the_s10_measurement() {
         assert!(
-            !fused_cohort_enabled_from(None),
-            "unset must mean OFF — the cohort path has never run on hardware"
+            fused_cohort_enabled_from(None),
+            "unset must mean ON — measured s10 leg 4 (arc-s10-ledger, 4d03b9e25): \
+             engaged at B=256, canaries byte-identical, 599.35 vs 575.12 tok/s"
         );
         assert!(fused_cohort_enabled_from(Some("1")));
     }
 
     /// Read by VALUE, not presence. #212 converted 23 `ARC_*` flags because
     /// `var_os(..).is_some()` made `ARC_FOO=0` mean ON — which also silently
-    /// cancels any A/B whose control arm sets the flag to zero.
+    /// cancels any A/B whose control arm sets the flag to zero. After the s10
+    /// flip the kill switch is the exact string "0" and nothing else.
     #[test]
-    fn zero_means_off_and_so_does_every_other_value() {
-        for v in ["0", "", "false", "no", "off", "true", "yes", "on", "2", "1 "] {
+    fn only_literal_zero_disables_the_cohort() {
+        assert!(
+            !fused_cohort_enabled_from(Some("0")),
+            "\"0\" must disable — it is the A/B control arm and the kill switch"
+        );
+        for v in ["", "false", "no", "off", "true", "yes", "on", "2", "1 ", "0 "] {
             assert!(
-                !fused_cohort_enabled_from(Some(v)),
-                "{v:?} must not enable the cohort path; only the exact string \"1\" does"
+                fused_cohort_enabled_from(Some(v)),
+                "{v:?} must leave the measured default ON; only the exact string \"0\" disables"
             );
         }
     }

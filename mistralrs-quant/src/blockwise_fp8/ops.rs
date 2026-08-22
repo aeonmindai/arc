@@ -1069,11 +1069,12 @@ fn fp8_wmma_eligible(block_size_y: i32, block_size_x: i32) -> bool {
 /// (see [`gemv_wide::wide_eligible`]); any shape that fails one keeps
 /// `fp8_gemv_warp`, unchanged, with no error.
 ///
-/// 🔴 Default OFF. `ARC_FP8_GEMV_WIDE=1` — and *only* the literal `"1"` —
-/// turns it on. The kernel has never run on a GPU and is not bit-identical to
-/// `fp8_gemv_warp` (it re-associates the f32 accumulation; the exact claim and
-/// its CPU proof are in `blockwise_fp8/gemv_wide.rs`). It must be A/B'd on
-/// hardware against the default before anyone considers flipping it.
+/// ✅ Default ON since the s10 hardware A/B (box `arc-s10-ledger`, candidate
+/// `4d03b9e25`, leg 3: 43.80 vs 40.76 tok/s b=1, engagement line
+/// `path=gemv_wide`, coherent canary). `ARC_FP8_GEMV_WIDE=0` — and *only* the
+/// literal `"0"` — restores `fp8_gemv_warp` from the same binary. It is not
+/// bit-identical to `fp8_gemv_warp` (it re-associates the f32 accumulation;
+/// the exact claim and its CPU proof are in `blockwise_fp8/gemv_wide.rs`).
 ///
 /// The pointers passed here are the ones the kernel will receive, so the
 /// 16-byte alignment a `uint4` load requires is checked on the real address
@@ -1323,7 +1324,7 @@ fn fp8_blockwise_matmul_impl(
                     k as usize,
                 );
                 if let Some(scale_shift) = wide_shift {
-                    // 🔴 UNVERIFIED ON HARDWARE. `ARC_FP8_GEMV_WIDE=1` only.
+                    // ✅ Measured s10 leg 3 (arc-s10-ledger, 4d03b9e25): +7.5% b=1. Default ON; `ARC_FP8_GEMV_WIDE=0` restores warp.
                     unsafe {
                         ffi::launch_fp8_gemv_wide_f16(
                             input_ptr as *const _,
@@ -1427,7 +1428,7 @@ fn fp8_blockwise_matmul_impl(
                     k as usize,
                 );
                 if let Some(scale_shift) = wide_shift {
-                    // 🔴 UNVERIFIED ON HARDWARE. `ARC_FP8_GEMV_WIDE=1` only.
+                    // ✅ Measured s10 leg 3 (arc-s10-ledger, 4d03b9e25): +7.5% b=1. Default ON; `ARC_FP8_GEMV_WIDE=0` restores warp.
                     unsafe {
                         ffi::launch_fp8_gemv_wide_bf16(
                             input_ptr as *const _,
